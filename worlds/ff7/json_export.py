@@ -230,8 +230,9 @@ class FF7JSONExporter:
             "starting_equipment_tier":      int(opts.starting_equipment_tier),
             # World
             "free_roam":             bool(opts.free_roam),
-            # Goal
-            "victory_condition":     int(opts.victory_condition),
+            # Goal (victory_condition retired as a player option; goals drives
+            # completion. GoldSaucer only needs defeat_sephiroth=0 for save setup and i didnt wanna break anything too much)
+            "victory_condition":     0,
             "death_link":            bool(opts.death_link),
         }
 

@@ -32,7 +32,7 @@ from .Options import (
     GilMultiplier,
     APMultiplier,
     StartWithChocoboLure,
-    VictoryCondition,
+    Goals,
 )
 from .Rules import apply_rules
 from .json_export import FF7JSONExporter
@@ -387,6 +387,9 @@ _FREE_ROAM_ONLY_ITEMS = frozenset({
     # Party members — in linear mode they join via story, so they are only AP
     # items in Free Roam.
     "Barret", "Tifa", "Aerith", "Red XIII", "Cait Sith", "Cid",
+    # Progressive Weapon spawner (1st Diamond, 2nd Ultimate, 3rd Ruby, 4th Emerald) because gated progression is sick although
+    # I wasnt sure about the ruby and emerald placements but i decided theyre both tough enough it didnt really matter who came first
+    "WEAPON Arrival",
 })
 
 # Optional party members (progression in Free Roam) and how many the goal
@@ -539,8 +542,10 @@ _FREE_ROAM_WEAPON_BOSSES = {
     "Defeat Ultimate Weapon": "ocean",      # roams the world map (chase by Gold/Highwind)
     "Defeat Emerald Weapon":  "underwater", # deep underwater — Submarine
     "Defeat Ruby Weapon":     "ocean",      # Gold Saucer desert (western continent)
-    # Diamond Weapon is omitted: his world-map model never renders in Free Roam, so
-    # he is fully hidden (ambient spawn neutralized in wm0.ev) and is not a check.
+    # Diamond Weapon stands at his vanilla walk-end roughly, which is foot-reachable with no traversal item — so "foot"
+    # (unlike vanilla, where his model never renders in Free Roam; a custom wm0.ev
+    # spawn makes him a collidable boss, gated on weapons_killed.bit1 so he stays dead).
+    "Defeat Diamond Weapon":  "foot",       # free them dogs
 }
 
 # Kalm Traveler (House: 2f, elmin4_2) trades — each check requires its rare-item
@@ -642,7 +647,7 @@ class FF7Web(WebWorld):
         OptionGroup(
             "Goal",
             [
-                VictoryCondition,
+                Goals,
                 DeathLink,
             ],
         ),
@@ -696,6 +701,16 @@ class FF7World(World):
                     + "\n  ".join(errors)
                 )
             FF7World._locations_validated = True
+
+        # Weapons goals need the Weapon fights: require Free Roam and force the
+        # checks on so the WEAPON Arrival chain has somewhere to go.
+        if "all_weapons" in self.options.goals.value:
+            if not self.options.free_roam:
+                raise Exception(
+                    f"FF7 ({self.multiworld.get_player_name(self.player)}): "
+                    "the all_weapons goal requires free_roam: true"
+                )
+            self.options.weapon_fight_checks.value = 1
 
         # Free Roam: force the early traversal keys into sphere-1 (foot-reachable)
         # locations so the world opens up. Green Chocobo reaches Junon; the
@@ -914,7 +929,8 @@ class FF7World(World):
 
         # Resolve weapon-boss traversal tiers to predicates (used below).
         _tier_rules = {"mountain": _mountain, "ocean": _ocean, "sub": _sub,
-                       "underwater": _underwater, "highwind": _has("Highwind")}
+                       "underwater": _underwater, "highwind": _has("Highwind"),
+                       "foot": (lambda state: True)}  # feets
 
         # Optionally drop every Gold Saucer check (and its shop slots) from the
         # pool — all those locations resolve to the "Gold Saucer Area" region.
@@ -969,13 +985,31 @@ class FF7World(World):
         # Weapon bosses are world-map encounters (not field maps), so wire them
         # directly onto World Map with their own access rules. Optional via
         # weapon_fight_checks (off = the Weapons aren't checks, just fightable).
+        # Each Weapon spawns from the Nth "WEAPON Arrival" progressive item and
+        # needs the access to actually fight it: Diamond = any 2 party members
+        # (on foot), Ultimate/Ruby = the Highwind, Emerald = the Submarine.
+        # kinda just trying to gate logic further with the party member count for diamond plus good luck fighting him without a full party lol
         if self.options.weapon_fight_checks:
-            for boss_name, tier in _FREE_ROAM_WEAPON_BOSSES.items():
+            arrival_rules = {
+                "Defeat Diamond Weapon": lambda state: (
+                    state.has("WEAPON Arrival", player, 1)
+                    and state.has_from_list(_PARTY_MEMBER_ITEMS, player, 2)),
+                "Defeat Ultimate Weapon": lambda state: (
+                    state.has("WEAPON Arrival", player, 2)
+                    and state.has("Highwind", player)),
+                "Defeat Ruby Weapon": lambda state: (
+                    state.has("WEAPON Arrival", player, 3)
+                    and state.has("Highwind", player)),
+                "Defeat Emerald Weapon": lambda state: (
+                    state.has("WEAPON Arrival", player, 4)
+                    and state.has("Submarine", player)),
+            }
+            for boss_name in _FREE_ROAM_WEAPON_BOSSES:
                 boss_data = ALL_LOCATION_TABLE.get(boss_name)
                 if boss_data is None:
                     continue
                 boss_loc = FF7Location(player, boss_name, boss_data.code, world_map)
-                boss_loc.access_rule = _tier_rules.get(tier, _ocean)
+                boss_loc.access_rule = arrival_rules.get(boss_name, _ocean)
                 world_map.locations.append(boss_loc)
 
         victory_loc = FF7Location(player, self.victory_location_name, None, world_map)
@@ -1017,6 +1051,8 @@ class FF7World(World):
                 continue
             if free_roam and name in _FREE_ROAM_EXCLUDE_ITEMS:
                 continue
+            if name == "WEAPON Arrival" and not self.options.weapon_fight_checks:
+                continue  # no Weapon checks -> nothing for the arrivals to unlock
             pool_names.extend([name] * data.count)
 
         # Classification with Free Roam downgrades applied (drives truncation).
@@ -1145,13 +1181,29 @@ class FF7World(World):
             "common_options": self._serialize_common_options(),
             "biton_map": exporter.build_biton_map_dict(),
             "shops": exporter._serialize_shops(),
-            "victory_condition": self.options.victory_condition.value,
+            "victory_condition": 0,   # legacy client fallback; goals is the real goal
             "free_roam": bool(self.options.free_roam),
             "exp_multiplier": int(self.options.exp_multiplier.value),
             "gil_multiplier": int(self.options.gil_multiplier.value),
             "ap_multiplier": int(self.options.ap_multiplier.value),
+            # Weapons spawn per received WEAPON Arrival copy.
+            "weapon_arrival": bool(self.options.free_roam and self.options.weapon_fight_checks),
+            # goals the client must see completed before sending victory
+            "goals": sorted(self.options.goals.value),
+            # weapons_killed (savemap 0xC1F) bits the all_weapons goal requires:
+            # Ultimate 0x01 + Diamond 0x02 + Ruby 0x08 + Emerald 0x10.
+            "weapon_goal_mask": 0x1B,
         }
 
     def generate_output(self, output_directory: str) -> None:
         exporter = FF7JSONExporter(self)
         exporter.write_file(output_directory)
+
+    def write_spoiler_header(self, spoiler_handle) -> None:
+        labels = {
+            "defeat_sephiroth": "Defeat Sephiroth",
+            "all_weapons": "Defeat All WEAPONS",
+        }
+        goals = sorted(self.options.goals.value)
+        desc = "; ".join(labels.get(g, g) for g in goals)
+        spoiler_handle.write(f"Victory Condition:               Complete All Goals - {desc}\n")

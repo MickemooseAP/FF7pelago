@@ -95,11 +95,17 @@ _RESUME_REDELIVER_TICKS = 3
 BATTLE_FORMATION_ADDR = 0x9AAD3C
 # Weapon battle formation id -> weapons_killed bit mask (ff7-ultima ff7Battles.ts:
 # 982/983 Ruby[Desert]=bit3 0x08, 984/985/986 Emerald[Underwater]=bit4 0x10).
-# Diamond Weapon is NOT here — he is fully hidden in Free Roam (his world-map model
-# never renders, so his ambient spawn is neutralized) and has no AP check.
-# Ultimate Weapon is NOT here either: he flees rather than dying, so a battle win
-# never happens — he is handled by _resolve_ultimate_weapon (engagement-based).
-_WEAPON_BATTLE_FORMATIONS = {982: 0x08, 983: 0x08, 984: 0x10, 985: 0x10, 986: 0x10}
+# Diamond Weapon (formation 980) = bit1 0x02: his vanilla ambient spawn is
+# neutralized, but a custom wm0.ev script re-spawns him as a collidable boss at his
+# walk-end (Midgar coast). Like Ruby/Emerald, the Free Roam endgame skips the
+# world-script that would set his kill flag, so we latch it here on the battle win
+# (his wm0.ev spawn is gated on weapons_killed.bit1 so he then stays dead).
+# Ultimate Weapon is NOT here: he flees rather than dying, so a battle win
+# never happens - he is handled by _resolve_ultimate_weapon (engagement-based).
+# formation id -> weapons_killed bit. Ultimate: ONLY 287 (scene71/3, the lethal
+# Cosmo battle - finite HP, no flee, unescapable). His 281 flee-chase battle is
+# NOT here: a flee from 281 also returns to World and would false-latch.
+_WEAPON_BATTLE_FORMATIONS = {287: 0x01, 980: 0x02, 982: 0x08, 983: 0x08, 984: 0x10, 985: 0x10, 986: 0x10}
 # Ultimate Weapon (Free Roam): his kill flag weapons_killed.bit[0] is set by his
 # FINAL BATTLE (no wm0 model-11 function writes it). The chase that whittles his HP
 # down to make that battle lethal is set up by the disc-2 intro, which Free Roam
@@ -775,6 +781,13 @@ class FF7Context(CommonContext):
         self._hook_injected: bool = False
         # Victory condition: 0 = defeat_sephiroth (default), 1 = escape_midgar
         self.victory_condition: int = 0
+        # Goal set (slot_data "goals"); empty = legacy victory_condition path.
+        self.goals: List[str] = []
+        self.weapon_goal_mask: int = 0x1B
+        self._sephiroth_done: bool = False
+        self._weapons_done: bool = False
+        # WEAPON Arrival progressive spawner (slot_data feature flag).
+        self.weapon_arrival: bool = False
         # Battle reward multipliers (from slot_data) + whether the exe patch ran.
         self.exp_multiplier: int = 1
         self.gil_multiplier: int = 1
@@ -816,6 +829,11 @@ class FF7Context(CommonContext):
             self.victory_condition = args.get("slot_data", {}).get("victory_condition", 0)
             self.free_roam = bool(args.get("slot_data", {}).get("free_roam", False))
             sd = args.get("slot_data", {})
+            self.goals = list(sd.get("goals", []))
+            self.weapon_goal_mask = int(sd.get("weapon_goal_mask", 0x1B))
+            self.weapon_arrival = bool(sd.get("weapon_arrival", False))
+            self._sephiroth_done = False
+            self._weapons_done = False
             self.exp_multiplier = max(1, int(sd.get("exp_multiplier", 1)))
             self.gil_multiplier = max(1, int(sd.get("gil_multiplier", 1)))
             self.ap_multiplier  = max(1, int(sd.get("ap_multiplier", 1)))
@@ -1260,46 +1278,494 @@ def _enforce_crater_lock(pm: "pymem.Pymem", ctx: "FF7Context") -> None:
         logger.debug(f"crater lock write failed: {exc}")
 
 
-def _resolve_ultimate_weapon(pm: "pymem.Pymem") -> None:
-    """Finish Ultimate Weapon in Free Roam AND advance to the post-Ultimate world
-    state so Ruby Weapon actually RENDERS.
+def _resolve_ultimate_weapon(pm: "pymem.Pymem", feature_on: bool) -> None:
+    """Finish Ultimate Weapon in Free Roam (his kill flag weapons_killed.bit[0]
+    is set by a final battle that never turns lethal because the disc-2 chase
+    is skipped - so once the player has engaged him via submarine_flags.bit[3],
+    set on the first ram, we latch bit[0] = death + AP check).
 
-    His kill flag (weapons_killed.bit[0]) is set by his final battle, which never
-    becomes lethal because the disc-2 chase is skipped — so once the player has
-    engaged him (submarine_flags.bit[3], set on the first ram) we set bit[0] (death
-    + the AP check). Ruby is gated by the overworld's world_progress: it
-    only reaches 4 ("after Ultimate killed") when weapons_killed.bit0 AND 0xF2B.0
-    AND submarine_flags.bit4 are all set, and the boss model GEOMETRY for Ruby only
-    loads at world_progress 4 (at 3 he's an invisible-but-collidable entity). A real
-    Ultimate kill sets all three; the engagement shortcut set only bit0, leaving wp
-    at 3 and Ruby invisible. So on resolving Ultimate we also set 0xF2A.4, 0xF2B.0,
-    and 0xF2B.4 (Ruby's spawn bit) — the full post-Ultimate state. No-op until
-    engaged."""
+    Legacy seeds also assert the full post-Ultimate world state here (0xF2A.4,
+    0xF2B.0, 0xF2B.4) so Ruby renders. With the WEAPON Arrival feature ON that
+    world state is owned by _resolve_ruby_spawn (arrival-count gated), so we do
+    ONLY the engagement->kill latch and touch none of the render flags."""
+    if feature_on:
+        # Arrival Ultimate is a real boss: he flees the 281 chase battles and is
+        # only killed in the lethal Cosmo battle 287, latched by
+        # _resolve_weapon_battles. Do NOT mark him defeated on mere engagement.
+        return
     try:
         wk_addr = SAVEMAP_BASE + WEAPONS_KILLED_OFFSET
         sf_addr = SAVEMAP_BASE + SUBMARINE_FLAGS_OFFSET
         wk = pm.read_uchar(wk_addr)
         sf = pm.read_uchar(sf_addr)
         if not (wk & 0x01):                       # not yet defeated
-            if not (sf & 0x08):                   # bit3 — not engaged yet
+            if not (sf & 0x08):                   # bit3 - not engaged yet
                 return
             pm.write_uchar(wk_addr, wk | 0x01)    # engaged → mark defeated
-            logger.debug("Ultimate Weapon defeated (Free Roam) — weapons_killed.bit[0] set.")
-        # Ultimate down: assert the post-Ultimate state so world_progress hits 4 and
-        # Ruby's model is drawn (he's invisible at wp3). Re-checked each poll so it
-        # self-heals across overworld reloads.
+            logger.debug("Ultimate Weapon defeated (Free Roam) - weapons_killed.bit[0] set.")
+        # Legacy: assert the post-Ultimate state so world_progress hits 4 and
+        # Ruby's model is drawn. Re-checked each poll (self-heals on reload).
         if not (sf & 0x10):                       # submarine_flags.bit4
             pm.write_uchar(sf_addr, sf | 0x10)
         f2b_addr = SAVEMAP_BASE + 0x0F2B
         f2b = pm.read_uchar(f2b_addr)
         if (f2b & 0x11) != 0x11:                  # 0xF2B.0 (wp4 cond) + 0xF2B.4 (Ruby spawn)
             pm.write_uchar(f2b_addr, f2b | 0x11)
-            logger.debug("Post-Ultimate world state set — Ruby Weapon should now render.")
-        # NOTE: Diamond Weapon is fully hidden in Free Roam (his world-map model
-        # never renders even at wp4), so his ambient spawn is neutralized in
-        # wm0.ev and nothing here touches his 0xEF6.3 flag.
+            logger.debug("Post-Ultimate world state set - Ruby Weapon should now render.")
     except Exception as exc:
         logger.debug(f"resolve ultimate weapon failed: {exc}")
+
+
+def _arm_diamond_arrived(pm: "pymem.Pymem") -> None:
+    """Arm Diamond fully-arrived and SILENT: bits 5/6/7 (march-started /
+    init-ran / spawn-sfx) set, arrived latch 0xF29.0 SET, walk word parked at
+    4037 - his init and update then do nothing at all on world-map load (no
+    march, no arrival roar/anim, and via 0xF29.1 no march music: the system
+    script's gate at wm0.ev 0x1b4a is `if 0xEF6.3 && 0xF29.4 && !0xF29.1 ->
+    SET_MUSIC(6)`). With the scripts silent his model would have no animation
+    (= not rendered), so _place_diamond_at_coast assigns his standing pose
+    directly via the entity animation fields."""
+    flags_addr = SAVEMAP_BASE + 0x0F28
+    pm.write_uchar(flags_addr, pm.read_uchar(flags_addr) | 0xE0)
+    arr_addr = SAVEMAP_BASE + 0x0F29
+    # bit0 arrived latch, bit1 kills the march-music gate, bit4 pre-latches
+    # the one-time "diamond appears" scene (cloud '!', shake, sting, fade;
+    # ev 0x3540: if 0xEF6.3 and not 0xF29.4 -> play scene, set 0xF29.4)
+    pm.write_uchar(arr_addr, pm.read_uchar(arr_addr) | 0x13)
+    pm.write_ushort(SAVEMAP_BASE + 0x0F34, 4037)
+
+
+# Diamond's parking spot - the vanilla stand location between the Northern
+# Crater and Midgar's coast, captured in-game by the user standing on it:
+# mesh (21,14), local (5536,1908). Facing tuned in-game; the entity facing is
+# a 12-bit angle (0-4095) stored as WORDS at +0x40 and +0x4C (per the SET_DIR
+# opcode handler: value<<4 & 0xFFF written to both).
+_DW_COAST_X   = 21 * 8192 + 5536   # 177568
+_DW_COAST_Y   = 14 * 8192 + 1908   # 116596
+_DW_COAST_DIR = 52 * 16            # 832 - user-tuned final facing
+
+
+def _place_diamond_at_coast(pm: "pymem.Pymem") -> None:
+    """Write Diamond's live world entity (model 10) to his Midgar-coast spot.
+    Same linked-list walk as _place_stranded_vehicles; both position copies
+    (current @+0x0C and mirror @+0x1C) are written; the engine snaps him to
+    terrain height. Idempotent - he is parked and never moves on his own."""
+    try:
+        ptr = pm.read_uint(_WORLD_ENTITY_PTR)
+    except Exception:
+        return
+    seen: Set[int] = set()
+    for _ in range(48):
+        if ptr == 0 or ptr < 0x400000 or ptr in seen:
+            return
+        seen.add(ptr)
+        try:
+            if pm.read_uchar(ptr + _WE_MODEL) == 10:
+                if pm.read_int(ptr + _WE_POS) != _DW_COAST_X:
+                    for off in (_WE_POS, _WE_POS + 0x10):
+                        pm.write_int(ptr + off, _DW_COAST_X)
+                        pm.write_int(ptr + off + 4, 0)
+                        pm.write_int(ptr + off + 8, _DW_COAST_Y)
+                    pm.write_ushort(ptr + 0x40, _DW_COAST_DIR)
+                    pm.write_ushort(ptr + 0x4C, _DW_COAST_DIR)
+                    # assign his arrival/stand pose directly (PLAY_ANIM handler
+                    # layout: anim id @+0x5D, frame reset @+0x53, one-shot flag
+                    # @+0x51 bit5) - the scripts are kept silent, and a world
+                    # model with no animation assigned does not render.
+                    pm.write_uchar(ptr + 0x5D, 4)
+                    pm.write_uchar(ptr + 0x53, 0)
+                    pm.write_uchar(ptr + 0x51, pm.read_uchar(ptr + 0x51) | 0x20)
+                    logger.debug("Diamond Weapon placed at his Midgar-coast spot.")
+                return
+            ptr = pm.read_uint(ptr + _WE_NEXT)
+        except Exception:
+            return
+
+
+# World-model geometry descriptors in ff7_en.exe .data: 20 bytes each -
+# {name_ptr, hrc_ptr, count, size, record_ptr}. The per-progress model lists
+# only include ONE roaming Weapon's geometry (ultima /dyb.hrc or ruby /cqc.hrc
+# in the states Free Roam reaches), and the model-id binding of each slot is
+# POSITIONAL within the list (verified: a diaweapon descriptor in a different
+# slot loads but never binds to model 10). So while Diamond is alive we
+# overwrite the WEAPON slot itself with the diaweapon descriptor (proven to
+# produce a visible, fightable Diamond; takes effect on the next world-map
+# load) and restore it once he is dead. To keep Ultimate/Ruby visible too, the
+# swap is deferred until the world map has been entered once in the session -
+# their geometry loads then and stays cached, so all three Weapons can render
+# at once afterwards (empirically confirmed). Addresses are scanned, not
+# hardcoded (name strings live in .data around 0x96C000-0x96E000).
+_DW_DESC_REGION = (0x96A900, 0x1600)   # descriptor table region (VA, size)
+_DW_STR_LO, _DW_STR_HI = 0x96C000, 0x96E000
+
+
+def _find_weapon_geo_slots(pm: "pymem.Pymem"):
+    """Locate the diaweapon descriptor and every ultima/ruby weapon-slot
+    descriptor. Returns (dia_bytes, [(slot_va, original_bytes), ...])."""
+    import struct as _struct
+    base, size = _DW_DESC_REGION
+    block = pm.read_bytes(base, size)
+    dia = None
+    slots = []
+    for off in range(0, size - 20, 4):
+        name_ptr, hrc_ptr = _struct.unpack_from('<II', block, off)
+        if not (_DW_STR_LO <= name_ptr < _DW_STR_HI and _DW_STR_LO <= hrc_ptr < _DW_STR_HI):
+            continue
+        try:
+            hrc = pm.read_bytes(hrc_ptr, 8)
+        except Exception:
+            continue
+        if hrc == b'/bna.hrc' and dia is None:
+            dia = block[off:off + 20]
+        elif hrc in (b'/dyb.hrc', b'/cqc.hrc'):
+            slots.append((base + off, block[off:off + 20]))
+    return dia, slots
+
+
+def _resolve_diamond_geometry(ctx, pm: "pymem.Pymem", alive: bool) -> None:
+    """Swap the roaming-Weapon geometry slots to diaweapon while Diamond is
+    alive; restore the originals once he is dead. Idempotent per state."""
+    try:
+        if alive and not getattr(ctx, "_dw_geo_swapped", False):
+            if not getattr(ctx, "_dw_seen_world", False):
+                return    # let Ultimate/Ruby geometry load+cache once first
+            dia, slots = _find_weapon_geo_slots(pm)
+            if dia is None or not slots:
+                return
+            ctx._dw_geo_slots = slots
+            for va, _orig in slots:
+                pm.write_bytes(va, dia, 20)
+            ctx._dw_geo_swapped = True
+            logger.debug(f"Diamond Weapon geometry swapped into {len(slots)} model slot(s).")
+        elif not alive and getattr(ctx, "_dw_geo_swapped", False):
+            for va, orig in ctx._dw_geo_slots:
+                pm.write_bytes(va, orig, 20)
+            ctx._dw_geo_swapped = False
+            logger.debug("Weapon geometry slots restored (Diamond defeated).")
+    except Exception as exc:
+        logger.debug(f"diamond geometry swap failed: {exc}")
+
+
+# The world map can only render ONE roaming Weapon: at map load a selector
+# function (0x766B9F, reads game_progress + savemap flags) picks which model
+# list to load, and Diamond's geometry+slot binding only exist in the disc-2
+# "march" states (selectors 1-4). Free Roam's game moment (1603) always lands
+# in the ultima/ruby states, so Diamond is invisible-but-collidable there.
+# While he is alive we code-patch the selector to return 4 - the diaweapon
+# state with the same Highwind/cannon cosmetics as Free Roam's normal state -
+# which makes him FULLY VISIBLE (confirmed in-game); Ultimate is invisible for
+# that duration (the engine's own one-Weapon rule) and comes back when Diamond
+# dies and the original bytes are restored. Takes effect on world-map (re)entry.
+_DW_SELECTOR_FN    = 0x766B9F
+_DW_SELECTOR_FORCE = bytes.fromhex("b804000000c3")   # mov eax, 4 ; ret
+_DW_SELECTOR_ORIG  = bytes.fromhex("558bec83ec08")   # push ebp; mov ebp,esp; sub esp,8
+
+
+def _code_write(pm: "pymem.Pymem", va: int, buf: bytes) -> None:
+    """Write into a code page (VirtualProtectEx dance)."""
+    import ctypes
+    k32 = ctypes.windll.kernel32
+    old = ctypes.c_ulong(0)
+    k32.VirtualProtectEx(pm.process_handle, ctypes.c_void_p(va), len(buf), 0x40, ctypes.byref(old))
+    pm.write_bytes(va, buf, len(buf))
+    k32.VirtualProtectEx(pm.process_handle, ctypes.c_void_p(va), len(buf), old.value, ctypes.byref(ctypes.c_ulong(0)))
+
+
+# Dual-render: the world map binds model ids to the 13 geometry slots via a
+# runtime byte table (VA 0xE3B0F8, value = slot+1, 0xFF = invisible) refilled
+# on every world-map load from a static master table (VA 0x96DF10, one 0x20
+# byte row per list selector). In the forced dia state (selector row 4)
+# Diamond owns slot 11 and Ultimate is 0xFF (the engine's one-roaming-Weapon
+# rule). But slot 9 ('tail') has no bound entity in that state - a free slot.
+# So while Diamond is alive: overwrite the selector-4 list slot-9 descriptor
+# with Ultimate's (his geometry loads there on map load) and patch master row
+# 4: id 11 -> slot 9, id 9 -> unbound. Both Weapons then render at once, each
+# with its own slot. Restored byte-exact when Diamond dies.
+_DW_SEL4_SLOT9_DESC = 0x96AE08 + 9 * 0x14
+_DW_SEL4_SLOT8_DESC = 0x96AE08 + 8 * 0x14
+_DW_MASTER_ROW4     = 0x96DF10 + 4 * 0x20
+_DW_ULTIMA_DESC     = bytes.fromhex("bccf9600c4cf96000700000000020000e8a89600")
+_DW_TAIL_DESC       = bytes.fromhex("7cce960084ce96000100000000030000b4a89600")
+_DW_RUBY_DESC       = bytes.fromhex("d0d19600d8d196000300000080020000 98a89600".replace(" ", ""))
+_DW_CANNON_DESC     = bytes.fromhex("64ce960070ce96000100000000100000 88a89600".replace(" ", ""))
+
+
+# Ruby-row lists (selectors 7/8, active post-Diamond now that Ruby's spawn
+# flags are always forced) leave Ultimate unbound - bind him into their free
+# slot 9 while he is alive, mirroring the row-4 treatment. Originals are
+# captured at runtime and restored byte-exact.
+_DW_RUBY_LISTS = ((0x96B120 + 9 * 0x14, 0x96DF10 + 7 * 0x20),
+                  (0x96B210 + 9 * 0x14, 0x96DF10 + 8 * 0x20))
+
+
+# WEAPON Arrival: progressive spawner item. copy 1 = Diamond, 2 = Ultimate,
+# 3 = Ruby, 4 = Emerald. legacy seeds (no slot_data flag) spawn everything.
+WEAPON_ARRIVAL_ITEM_CODE = 300610
+# client-owned savemap bits read by the patched world-script loader gates:
+# Ultimate's wm0 load gate = 0xF29.bit2, Emerald's wm2 load gate = 0xF2B.bit6.
+ULTIMATE_ARRIVAL_ADDR, ULTIMATE_ARRIVAL_MASK = 0x0F29, 0x04
+EMERALD_ARRIVAL_ADDR, EMERALD_ARRIVAL_MASK = 0x0F2B, 0x40
+
+
+def _weapon_arrival_count(ctx) -> int:
+    """received WEAPON Arrival copies; unlimited when the feature is off."""
+    if not ctx.weapon_arrival:
+        return 99
+    return sum(1 for it in ctx.items_received if it.item == WEAPON_ARRIVAL_ITEM_CODE)
+
+
+def _set_savemap_bit(pm: "pymem.Pymem", offset: int, mask: int, on: bool) -> None:
+    addr = SAVEMAP_BASE + offset
+    v = pm.read_uchar(addr)
+    want = (v | mask) if on else (v & ~mask)
+    if want != v:
+        pm.write_uchar(addr, want)
+
+
+def _resolve_ruby_spawn(pm: "pymem.Pymem", arrivals: int, feature_on: bool) -> None:
+    """Drive Ruby's spawn/render flags by WEAPON Arrival count.
+
+    Two layers: (a) the post-Ultimate world state (0xF2B.0 + submarine_flags.4)
+    that puts the overworld at world_progress 4 so any ocean Weapon's geometry
+    renders - needed from arrival 2 (Ultimate) on; (b) Ruby's own load/spawn
+    flag 0xF2B.4 - arrival 3 on. When the arrival feature is off (legacy
+    seeds), both are forced on so everything spawns as before. Below the
+    threshold the bits are actively CLEARED, so a lower count (or a stale save)
+    can never leave a Weapon rendering."""
+    want_wp4  = (not feature_on) or arrivals >= 2
+    want_ruby = (not feature_on) or arrivals >= 3
+    try:
+        _set_savemap_bit(pm, 0x0F2B, 0x01, want_wp4)                # wp4 condition
+        _set_savemap_bit(pm, SUBMARINE_FLAGS_OFFSET, 0x10, want_wp4)  # submarine_flags.4
+        _set_savemap_bit(pm, 0x0F2B, 0x10, want_ruby)              # Ruby spawn/load bit
+    except Exception as exc:
+        logger.debug(f"resolve ruby spawn failed: {exc}")
+
+
+def _bind_weapon_render_slots(ctx, pm: "pymem.Pymem", wk: int) -> None:
+    """Make every living roaming Weapon renderable in every world state the
+    run can reach. Row 4 (forced while Diamond lives): Ultimate -> slot 9
+    (unbound 'tail'), Ruby -> slot 8 (never-loaded Sister Ray). Rows 7/8
+    (ruby states, active post-Diamond): Ultimate -> slot 9. All restored
+    byte-exact when the relevant Weapon dies."""
+    diamond_alive  = not (wk & 0x02)
+    ultimate_alive = not (wk & 0x01)
+    try:
+        r78 = getattr(ctx, "_dw_r78_bound", None)
+        if ultimate_alive and r78 is None:
+            saved = []
+            for desc_va, row_va in _DW_RUBY_LISTS:
+                saved.append((desc_va, pm.read_bytes(desc_va, 20),
+                              row_va, pm.read_uchar(row_va + 9), pm.read_uchar(row_va + 11)))
+                pm.write_bytes(desc_va, _DW_ULTIMA_DESC, 20)
+                pm.write_uchar(row_va + 11, 0x0A)        # Ultimate -> slot 9
+                pm.write_uchar(row_va + 9, 0xFF)         # tail id -> unbound
+            ctx._dw_r78_bound = saved
+            logger.debug("Ruby rows bound: Ultimate renders alongside Ruby post-Diamond.")
+        elif not ultimate_alive and r78:
+            for desc_va, desc, row_va, c9, c11 in r78:
+                pm.write_bytes(desc_va, desc, 20)
+                pm.write_uchar(row_va + 9, c9)
+                pm.write_uchar(row_va + 11, c11)
+            ctx._dw_r78_bound = None
+            logger.debug("Ruby-row render bindings restored (Ultimate defeated).")
+
+        bound = getattr(ctx, "_dw_ult_bound", False)
+        if diamond_alive and not bound:
+            pm.write_bytes(_DW_SEL4_SLOT9_DESC, _DW_ULTIMA_DESC, 20)
+            pm.write_bytes(_DW_SEL4_SLOT8_DESC, _DW_RUBY_DESC, 20)
+            pm.write_uchar(_DW_MASTER_ROW4 + 11, 0x0A)   # Ultimate -> slot 9
+            pm.write_uchar(_DW_MASTER_ROW4 + 9, 0xFF)    # tail id -> unbound
+            pm.write_uchar(_DW_MASTER_ROW4 + 29, 0x09)   # Ruby -> slot 8
+            pm.write_uchar(_DW_MASTER_ROW4 + 20, 0xFF)   # cannon id -> unbound
+            ctx._dw_ult_bound = True
+            logger.debug("Ultimate (slot 9) and Ruby (slot 8) bound - triple Weapon render armed.")
+        elif not diamond_alive and bound:
+            pm.write_bytes(_DW_SEL4_SLOT9_DESC, _DW_TAIL_DESC, 20)
+            pm.write_bytes(_DW_SEL4_SLOT8_DESC, _DW_CANNON_DESC, 20)
+            pm.write_uchar(_DW_MASTER_ROW4 + 11, 0xFF)
+            pm.write_uchar(_DW_MASTER_ROW4 + 9, 0x0A)
+            pm.write_uchar(_DW_MASTER_ROW4 + 29, 0xFF)
+            pm.write_uchar(_DW_MASTER_ROW4 + 20, 0x09)
+            ctx._dw_ult_bound = False
+            logger.debug("Weapon render bindings restored (Diamond defeated).")
+    except Exception as exc:
+        logger.debug(f"dual-render binding failed: {exc}")
+
+
+# Diamond's Highwind-bounce distance check in his wm0 update (push_special 8;
+# distance_to_player; push_const <val>; le) ships with a threshold of 120,
+# which a flying Highwind never gets inside - you pass through him with no
+# knockback. User-tuned replacement value below. The ev script reloads from
+# the iro on every world-map entry, so the constant must be re-applied to the
+# loaded copies; addresses are found with one full process scan per session
+# and cheaply re-verified afterwards.
+_DW_BOUNCE_PRE  = bytes.fromhex("1b01080019001001")
+_DW_BOUNCE_POST = bytes.fromhex("6200")
+_DW_BOUNCE_DIST = 220
+
+
+def _scan_process_for(pm: "pymem.Pymem", sig: bytes) -> "List[int]":
+    """Scan all committed readable memory for a byte signature."""
+    import ctypes
+
+    class MBI(ctypes.Structure):
+        _fields_ = [("BaseAddress", ctypes.c_void_p), ("AllocationBase", ctypes.c_void_p),
+                    ("AllocationProtect", ctypes.c_ulong), ("RegionSize", ctypes.c_size_t),
+                    ("State", ctypes.c_ulong), ("Protect", ctypes.c_ulong), ("Type", ctypes.c_ulong)]
+
+    k32 = ctypes.windll.kernel32
+    hits: List[int] = []
+    addr = 0
+    mbi = MBI()
+    while addr < 0x7FFF0000:
+        if not k32.VirtualQueryEx(pm.process_handle, ctypes.c_void_p(addr), ctypes.byref(mbi), ctypes.sizeof(mbi)):
+            break
+        size = mbi.RegionSize or 0x1000
+        if mbi.State == 0x1000 and (mbi.Protect or 0) & 0xEE:
+            try:
+                buf = pm.read_bytes(addr, min(size, 32 * 1024 * 1024))
+                i = 0
+                while True:
+                    j = buf.find(sig, i)
+                    if j < 0:
+                        break
+                    hits.append(addr + j)
+                    i = j + 1
+            except Exception:
+                pass
+        addr += size
+    return hits
+
+
+def _apply_diamond_bounce_threshold(ctx, pm: "pymem.Pymem") -> None:
+    """Keep the bounce threshold at _DW_BOUNCE_DIST in every loaded wm0.ev
+    copy (they revert to 120 whenever the map reloads the script)."""
+    try:
+        addrs = getattr(ctx, "_dw_bounce_addrs", None)
+        if addrs is None:
+            addrs = _scan_process_for(pm, _DW_BOUNCE_PRE)
+            ctx._dw_bounce_addrs = addrs
+            logger.debug(f"bounce-threshold sites: {len(addrs)}")
+        stale = 0
+        for a in addrs:
+            try:
+                if pm.read_bytes(a, 8) != _DW_BOUNCE_PRE or pm.read_bytes(a + 10, 2) != _DW_BOUNCE_POST:
+                    stale += 1
+                    continue
+                if pm.read_ushort(a + 8) != _DW_BOUNCE_DIST:
+                    pm.write_ushort(a + 8, _DW_BOUNCE_DIST)
+            except Exception:
+                stale += 1
+        if addrs and stale == len(addrs):
+            ctx._dw_bounce_addrs = None    # buffers moved - rescan next poll
+    except Exception as exc:
+        logger.debug(f"bounce threshold patch failed: {exc}")
+
+
+def _force_diamond_world_state(pm: "pymem.Pymem", weapons_killed: int) -> None:
+    """Patch/restore the model-list selector so Diamond renders while he is
+    alive. Diamond is the FIRST roaming Weapon in the intended kill order (foot
+    tier - reachable before any traversal item), so he owns the visible slot
+    until he is defeated; Ultimate/Ruby get their models back the moment his
+    kill bit latches (the engine can only ever render one roaming Weapon)."""
+    diamond_alive = not (weapons_killed & 0x02)
+    try:
+        cur = pm.read_bytes(_DW_SELECTOR_FN, 6)
+        if diamond_alive and cur == _DW_SELECTOR_ORIG:
+            _code_write(pm, _DW_SELECTOR_FN, _DW_SELECTOR_FORCE)
+            logger.debug("World model state forced to diaweapon - Diamond Weapon will render.")
+        elif not diamond_alive and cur == _DW_SELECTOR_FORCE:
+            _code_write(pm, _DW_SELECTOR_FN, _DW_SELECTOR_ORIG)
+            logger.debug("World model state restored (Diamond defeated).")
+    except Exception as exc:
+        logger.debug(f"diamond world-state patch failed: {exc}")
+
+
+def _resolve_diamond_weapon(ctx, pm: "pymem.Pymem") -> None:
+    """Keep the (custom) map-fightable Diamond Weapon spawned, VISIBLE, and
+    sanely positioned in Free Roam until he is defeated.
+
+    Diamond's world-map model load, placement, and walk are all gated on the
+    disc-2 "Diamond marches on Midgar" flag Savemap[0xEF6].bit[3] AND the
+    march-started flag 0xF28.bit5, both set by disc-2 story scripts that Free
+    Roam's game moment (1603) skips. His emerge/march is a state machine in his
+    wm0 update driven by Savemap[0xF34].word (0 -> 4036 arrival; incremented
+    every frame regardless, clamped only inside the gated block, so stale saves
+    hold garbage). Init assigns his walk animation ONLY in its first-march
+    branch (bit6 clear), and its mid-march branch never repositions him - a
+    world-map re-entry mid-march drops the entity at the map origin. So: force
+    the flags, and re-arm a clean first-march whenever the player is OFF the
+    world map - every world-map entry then spawns him fresh and visible at
+    mesh (20,11) marching to the Midgar coast. Geometry residency is handled by
+    _resolve_diamond_geometry. His init/update/touch are gated on
+    weapons_killed.bit1 (0xC1F.1; latched by _resolve_weapon_battles on a
+    formation-980 win): once set, everything here goes quiet and he stays dead."""
+    try:
+        wk = pm.read_uchar(SAVEMAP_BASE + WEAPONS_KILLED_OFFSET)
+        arrivals = _weapon_arrival_count(ctx)
+        alive = not (wk & 0x02)
+        diamond_on = alive and arrivals >= 1
+        module = pm.read_uchar(GAME_MODULE_ADDR)
+        # not-yet-arrived weapons are treated as dead by the render machinery
+        wk_eff = wk if diamond_on else (wk | 0x02)
+        _force_diamond_world_state(pm, wk_eff)
+        _bind_weapon_render_slots(ctx, pm, wk_eff)
+        _resolve_ruby_spawn(pm, arrivals, ctx.weapon_arrival)
+        # Ultimate's patched wm0 load gate and Emerald's patched wm2 load gate
+        # read these client-owned bits (arrival copies 2 and 4).
+        _set_savemap_bit(pm, ULTIMATE_ARRIVAL_ADDR, ULTIMATE_ARRIVAL_MASK, arrivals >= 2)
+        _set_savemap_bit(pm, EMERALD_ARRIVAL_ADDR, EMERALD_ARRIVAL_MASK, arrivals >= 4)
+        # Ultimate: pin him settled at the Cosmo spot (no flee-chase). His init
+        # places him by roam-byte 0x394 (13 = mesh 11,15 = Cosmo); the settle /
+        # touch->lethal-287 path needs 0xC1F.2 (his "HP<20k weakened" flag) and
+        # 0xF2A.3 (engaged). Touching him then goes straight to battle 287.
+        if arrivals >= 2 and not (wk & 0x01):
+            _set_savemap_bit(pm, 0x0F2A, 0x08, True)     # engaged
+            _set_savemap_bit(pm, WEAPONS_KILLED_OFFSET, 0x04, True)  # weakened (HP<20k)
+            if pm.read_uchar(SAVEMAP_BASE + 0x0F38) != 13:
+                pm.write_uchar(SAVEMAP_BASE + 0x0F38, 13)   # Cosmo settle location
+        if not diamond_on:
+            if alive:
+                # no arrival yet: keep his march flag off so he never loads
+                march_addr = SAVEMAP_BASE + 0x0EF6
+                march = pm.read_uchar(march_addr)
+                if march & 0x08:
+                    pm.write_uchar(march_addr, march & ~0x08)
+            return
+        march_addr = SAVEMAP_BASE + 0x0EF6
+        march = pm.read_uchar(march_addr)
+        if not (march & 0x08):                    # 0xEF6.bit3 - force spawn/walk on
+            pm.write_uchar(march_addr, march | 0x08)
+        # kill the "diamond appears" scene (gate: 0xEF6.3 && !0xF29.4)
+        _set_savemap_bit(pm, 0x0F29, 0x10, True)
+        if module != GAME_MODULE_WORLD:
+            # Keep him armed as already-arrived while off the world map: entry
+            # then creates a silent parked entity (no march, no SFX, no music
+            # trigger) that we place at the coast below.
+            _arm_diamond_arrived(pm)
+            ctx._dw_roared = False
+        else:
+            _place_diamond_at_coast(pm)
+            _apply_diamond_bounce_threshold(ctx, pm)
+            # Roar greeting: when the player closes in (Highwind flyby or an
+            # on-foot approach), clear the arrived latch with the walk word at
+            # 4036 - his update then runs the vanilla arrival once (roar anim
+            # + SFX 432) and re-latches itself. Hysteresis: re-arms only after
+            # the player has left the area.
+            px = pm.read_int(_WORLD_PLAYER_POS)
+            py = pm.read_int(_WORLD_PLAYER_POS + 8)
+            d2 = (px - _DW_COAST_X) ** 2 + (py - _DW_COAST_Y) ** 2
+            if d2 < 2500 ** 2 and not getattr(ctx, "_dw_roared", False):
+                arr_addr = SAVEMAP_BASE + 0x0F29
+                pm.write_uchar(arr_addr, pm.read_uchar(arr_addr) & ~0x01)
+                pm.write_ushort(SAVEMAP_BASE + 0x0F34, 4036)
+                ctx._dw_roared = True
+                logger.debug("Diamond Weapon roars at the approaching player.")
+            elif d2 > 4000 ** 2:
+                ctx._dw_roared = False
+    except Exception as exc:
+        logger.debug(f"resolve diamond weapon failed: {exc}")
 
 
 def _resolve_weapon_battles(ctx, pm: "pymem.Pymem") -> None:
@@ -1332,6 +1798,10 @@ def _resolve_weapon_battles(ctx, pm: "pymem.Pymem") -> None:
             new = wk | ctx._weapon_kill_pending
             if new != wk:
                 names = []
+                if ctx._weapon_kill_pending & 0x01:
+                    names.append("Ultimate")
+                if ctx._weapon_kill_pending & 0x02:
+                    names.append("Diamond")
                 if ctx._weapon_kill_pending & 0x08:
                     names.append("Ruby")
                 if ctx._weapon_kill_pending & 0x10:
@@ -2173,9 +2643,11 @@ async def game_watcher(ctx: FF7Context) -> None:
 
             # ── Free Roam: finish Ultimate Weapon once the player has engaged him ─
             if ctx.free_roam:
-                _resolve_ultimate_weapon(pm)
-                # Register Ruby/Emerald kills from a won battle (their flags are
-                # otherwise never set in Free Roam → no check + endless respawn).
+                _resolve_ultimate_weapon(pm, ctx.weapon_arrival)
+                # Keep the map-fightable Diamond Weapon spawned until he is defeated.
+                _resolve_diamond_weapon(ctx, pm)
+                # Register Diamond/Ruby/Emerald kills from a won battle (their flags
+                # are otherwise never set in Free Roam → no check + endless respawn).
                 _resolve_weapon_battles(ctx, pm)
                 # Force disc 3 (Free Roam = endgame). New games default to disc 1;
                 # re-assert each poll in case the engine resets it.
@@ -2253,16 +2725,41 @@ async def game_watcher(ctx: FF7Context) -> None:
             _strip_token_materia(pm, ctx)
 
             # ── Check win condition ───────────────────────────────────────
+            # goals is a set; ALL selected goals must be complete. legacy
+            # seeds without slot_data goals fall back to victory_condition.
             if not ctx.finished_game and ctx.server and ctx.slot:
-                if ctx.victory_condition == 1:  # escape_midgar
+                if ctx.goals:
+                    done = []
+                    for goal in ctx.goals:
+                        if goal == "defeat_sephiroth":
+                            # sephiroth kill latches once seen (the ending
+                            # modules are transient; weapons may come after)
+                            if not ctx._sephiroth_done:
+                                module = pm.read_uchar(GAME_MODULE_ADDR)
+                                if module in (GAME_MODULE_ENDING, GAME_MODULE_CREDITS):
+                                    ctx._sephiroth_done = True
+                                    logger.info("Goal part complete - Sephiroth defeated!")
+                            done.append(ctx._sephiroth_done)
+                        elif goal == "all_weapons":
+                            wk = pm.read_uchar(SAVEMAP_BASE + WEAPONS_KILLED_OFFSET)
+                            part = (wk & ctx.weapon_goal_mask) == ctx.weapon_goal_mask
+                            if part and not ctx._weapons_done:
+                                ctx._weapons_done = True
+                                logger.info("Goal part complete - all Weapons defeated!")
+                            done.append(part or ctx._weapons_done)
+                        else:
+                            done.append(False)   # unknown future goal: never auto-complete
+                    reached_goal = bool(done) and all(done)
+                    goal_message = "Goal complete - all goals achieved!"
+                elif ctx.victory_condition == 1:  # escape_midgar
                     reached_goal = game_moment >= MIDGAR_ESCAPE_MOMENT
-                    goal_message = "Goal complete — Escaped from Midgar!"
+                    goal_message = "Goal complete - Escaped from Midgar!"
                 else:  # defeat_sephiroth (default)
                     # The game switches the live module to Ending/Credits only after
-                    # Sephiroth is beaten — the reliable "on the kill" signal.
+                    # Sephiroth is beaten - the reliable "on the kill" signal.
                     module = pm.read_uchar(GAME_MODULE_ADDR)
                     reached_goal = module in (GAME_MODULE_ENDING, GAME_MODULE_CREDITS)
-                    goal_message = "Goal complete — Sephiroth defeated!"
+                    goal_message = "Goal complete - Sephiroth defeated!"
                 if reached_goal:
                     ctx.finished_game = True
                     await ctx.send_msgs([{"cmd": "StatusUpdate", "status": ClientStatus.CLIENT_GOAL}])

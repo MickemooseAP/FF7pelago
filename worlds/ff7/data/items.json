@@ -2803,5 +2803,12 @@
     "classification": "progression",
     "category": "character",
     "count": 1
+  },
+  {
+    "name": "WEAPON Arrival",
+    "code": 300610,
+    "classification": "progression",
+    "category": "key_item",
+    "count": 4
   }
 ]
