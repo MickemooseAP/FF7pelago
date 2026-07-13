@@ -22,12 +22,17 @@ import argparse
 import asyncio
 import json
 import random
+import struct
+from collections import deque
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Set, Tuple
+
+if TYPE_CHECKING:
+    from worlds.ff7.TrapLink import TrapSpec
 
 from CommonClient import CommonContext, ClientCommandProcessor, logger, server_loop
 from NetUtils import ClientStatus
-from Utils import user_path
+from Utils import async_start, user_path
 
 try:
     from Utils import gui_enabled
@@ -83,6 +88,19 @@ GAME_MODULE_ENDING  = 25        # post-final-battle ending sequence
 GAME_MODULE_GAMEOVER = 26
 GAME_MODULE_CREDITS = 28        # staff roll
 
+# Field-model object array (2013 Steam build; ff7-lib addresses.rs, maciej-trebacz).
+# Each on-field model is a 0x88-byte struct at FIELD_MODELS_OBJS + index*0x88, where
+# index = the entity's CHAR-opcode operand. Relevant bytes: +0x5f collision
+# (0 = solid), +0x61 interaction (0 = talkable), +0x62 visible (1 = shown). These
+# are what FF7 Ultima's field-model toggle writes. FIELD_NAME_ADDR = current field's
+# name string (e.g. "crcin_1").
+FIELD_NAME_ADDR          = 0xCC1EF0
+FIELD_MODELS_OBJS        = 0xCC1670
+_FIELD_MODEL_STRUCT_SIZE = 0x88
+
+# in-battle actor memory (party status/hp) lives in worlds/ff7/TrapLink.py,
+# shared by the traps and deathlink.
+
 # Free Roam game-over recovery: number of consecutive in-game (Field/World) polls
 # required after a Game Over before we re-deliver all received items. Gives the
 # new-game md1stin savemap seeding time to finish so our re-writes aren't clobbered.
@@ -100,19 +118,19 @@ BATTLE_FORMATION_ADDR = 0x9AAD3C
 # walk-end (Midgar coast). Like Ruby/Emerald, the Free Roam endgame skips the
 # world-script that would set his kill flag, so we latch it here on the battle win
 # (his wm0.ev spawn is gated on weapons_killed.bit1 so he then stays dead).
-# Ultimate Weapon is NOT here: he flees rather than dying, so a battle win
-# never happens - he is handled by _resolve_ultimate_weapon (engagement-based).
-# formation id -> weapons_killed bit. Ultimate: ONLY 287 (scene71/3, the lethal
-# Cosmo battle - finite HP, no flee, unescapable). His 281 flee-chase battle is
-# NOT here: a flee from 281 also returns to World and would false-latch.
+# Ultimate: ONLY 287 (scene71/3, the lethal Cosmo battle - finite HP, no flee,
+# unescapable) latches a kill here. His other chase formations (280-286/294/988,
+# esp. the 281 flee-chase) are NOT in this dict: _resolve_weapon_battles commits a
+# pending kill on any return-to-World (no flee distinction), so a fled 281 would
+# false-latch Ultimate as dead. The legacy (feature-off) path instead latches him
+# via engagement in _resolve_ultimate_weapon.
 _WEAPON_BATTLE_FORMATIONS = {287: 0x01, 980: 0x02, 982: 0x08, 983: 0x08, 984: 0x10, 985: 0x10, 986: 0x10}
 # Ultimate Weapon (Free Roam): his kill flag weapons_killed.bit[0] is set by his
-# FINAL BATTLE (no wm0 model-11 function writes it). The chase that whittles his HP
-# down to make that battle lethal is set up by the disc-2 intro, which Free Roam
-# skips (jumps to moment 1603) — so he never goes down. Once the player has engaged
-# him (submarine_flags.bit[3], set on the first ram), we finish him by setting
-# weapons_killed.bit[0] (death + the "Defeat Ultimate Weapon" check). The Ancient
-# Forest is separate — its entrance only needs the player on foot/chocobo.
+# FINAL BATTLE, but the disc-2 chase that makes that battle lethal is skipped in Free
+# Roam, so the engine may never set it on its own. We register the kill the same way
+# as Ruby/Emerald: watch the live battle formation and, on returning to the map after
+# an Ultimate battle, set weapons_killed.bit[0] (the "Defeat Ultimate Weapon" check).
+# _resolve_ultimate_weapon then asserts the post-Ultimate world state so Ruby renders.
 WEAPONS_KILLED_OFFSET  = 0x0C1F  # byte: bit0 = killed, bit2 = HP < 20,000
 SUBMARINE_FLAGS_OFFSET = 0x0F2A  # byte: bit3 = Ultimate Weapon chase started/engaged
 # Current disc (ff7tk FF7SLOT.disc; live 0xDBFD38+0x0EA4 = 0xDC0BDC = ff7-ultima
@@ -152,6 +170,9 @@ _FREE_ROAM_FORCE_FLAGS = [
     (0x0C25, 5),   # #5 Tifa: "5 years ago"
     (0x0C25, 6),   # #6 Cloud: "Hey!" (climb tower)
     (0x0C25, 7),   # #7 Reached top of pole
+    # NOTE: Cave of the Gi (cosin2) story is handled by Gold Saucer neutering the
+    # BUGEN cutscene script directly (GI_CAVE_STORY), not a force-flag. The earlier
+    # Var[3][173].7 attempt did not gate it and was removed.
     # NOTE: Var[3][189] bit 4 (0xD61.4, the "& 16" field-script gate) is no longer
     # forced here — removed at request.
     # NOTE: Ruby Weapon's spawn (0xF2B.4) is NOT forced here anymore. Ruby's model
@@ -171,6 +192,9 @@ _FREE_ROAM_ITEM_GATE_FLAGS = [
     # (Var[1][0x43].4, set by KEY_ITEM_FLAGS), so the door opens from holding
     # the key while 0x0C8C.1 is freed for the (re-introduced) check. See the
     # FieldPickup patch "BASEMENT_GATE".
+    # NOTE: Leviathan Scales location 200336 now uses bit 2 (not bit 0) for
+    # pickup detection to avoid conflict with this possession flag. The chest
+    # script checks bit 2, while game scripts check bit 0 for possession.
     ("Leviathan Scales", 0x1031, 0),   # "has Leviathan Scales" prerequisite — Var[15][141].0
                                        # (0xFA4+0x8D). Field scripts gate their reward branches
                                        # on this being ON. NOT setting Var[15][137].* — those are
@@ -276,6 +300,22 @@ def _token_section_index(token_type: str, tid: int) -> Tuple[int, int]:
     if token_type == "materia":
         return KTEXT_MATERIA, tid
     return KTEXT_ITEM, tid                   # composite id (consumable/weapon/armor/accessory)
+
+
+def _read_apff7_json(path: "Path") -> dict:
+    """Read the .apff7 seed: either the APPlayerContainer zip the apworld emits
+    (payload member ff7_seed.json alongside the archipelago.json manifest) or
+    the legacy bare-JSON format. Sniffed by the PK zip magic."""
+    raw = path.read_bytes()
+    if raw[:2] == b"PK":
+        import io
+        import zipfile
+        with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+            names = zf.namelist()
+            member = ("ff7_seed.json" if "ff7_seed.json" in names else
+                      next(n for n in names if not n.endswith("archipelago.json")))
+            return json.loads(zf.read(member).decode("utf-8"))
+    return json.loads(raw.decode("utf-8"))
 
 
 def _shops_from_apff7(
@@ -436,7 +476,7 @@ class FF7CommandProcessor(ClientCommandProcessor):
             return False
 
         try:
-            data = json.loads(json_path.read_text(encoding="utf-8"))
+            data = _read_apff7_json(json_path)
             biton_map = _biton_map_from_placements(data.get("placements", []))
             item_loc, mat_loc, item_names, mat_names, item_descs, mat_descs = \
                 _shops_from_apff7(data.get("shops", []))
@@ -604,14 +644,36 @@ class FF7CommandProcessor(ClientCommandProcessor):
         in Free Roam: a game over reloads the baseline and wipes your delivered
         items, and /resync restores your key items, vehicles, party members,
         chocobos and inventory. (The client also does this automatically when it
-        detects you've returned to play after a Game Over.) Best run right after
-        the wipe — re-running it while items are still in your inventory can
-        duplicate stackable items and materia."""
+        detects you've returned to play after a Game Over.) Safe to run anytime —
+        stackable items and materia are reconciled to their AP-granted total, so
+        anything still in your inventory is left alone (only the missing amount is
+        added)."""
         n = _requeue_all_received_items(self.ctx)
         if n:
             logger.info(f"Re-delivering {n} received AP item(s) on the next tick…")
         else:
             logger.info("No received AP items to re-deliver yet.")
+        return True
+
+    def _cmd_trap(self, name: str = "") -> bool:
+        """Manually fire a trap by name, e.g. `/trap frog` or `/trap poison`. The
+        trap goes through the normal queue, so a battle-only trap fires on your
+        next battle. Run `/trap` with no name to list the available traps."""
+        from worlds.ff7.TrapLink import TRAP_REGISTRY, resolve_trap
+
+        ctx = self.ctx
+        available = ", ".join(sorted(s.name for s in TRAP_REGISTRY.values()))
+        query = name.strip()
+        if not query:
+            logger.info(f"Usage: /trap <name>.  Available traps: {available}")
+            return True
+        spec = resolve_trap(query)
+        if spec is None:
+            logger.warning(f"Unknown trap '{query}'.  Available traps: {available}")
+            return True
+        ctx._trap_queue.append(spec)
+        when = "on your next battle" if spec.battle_only else "shortly"
+        logger.info(f"Queued {spec.name} - it will fire {when}.")
         return True
 
     def _cmd_rewards(self) -> bool:
@@ -730,6 +792,12 @@ class FF7Context(CommonContext):
     command_processor: type = FF7CommandProcessor
     items_handling   = 0b111
 
+    def make_gui(self):
+        # Rename the window from the default "Archipelago Text Client".
+        ui = super().make_gui()
+        ui.base_title = "Archipelago Final Fantasy VII Client"
+        return ui
+
     def __init__(self, server_address: Optional[str], password: Optional[str]) -> None:
         super().__init__(server_address, password)
         self.finished_game: bool = False
@@ -755,12 +823,42 @@ class FF7Context(CommonContext):
         # Item delivery state (persists across poll cycles)
         self._delivered_item_indices: Set[int] = set()
         self._pending_items: List[Tuple[int, object]] = []
+        # Set while re-delivering the full item set (/resync or game-over recovery).
+        # In this mode, stackable items + materia are RECONCILED to their AP-granted
+        # target quantity (only the missing amount is added) instead of blindly
+        # stacked, so re-syncing with items still present can't duplicate them.
+        # Normal incremental delivery leaves this False (plain additive writes).
+        self._resync_reconcile: bool = False
+        # ── trap queue (see worlds/ff7/TrapLink.py) ──────────────────────────
+        # traps ride the item pipeline into _trap_queue and TrapLink.pump_trap_queue
+        # fires one per tick. _seen_trap_indices is never cleared, so a game-over
+        # re-deliver can't re-trigger a trap.
+        self._trap_queue: "deque[TrapSpec]" = deque()
+        self._priority_trap: Optional["TrapSpec"] = None   # inbound traplink (latest wins)
+        self._seen_trap_indices: Set[int] = set()
+        self._last_trap_activation: float = 0.0
+        self._bomb_field_reset: Optional[int] = None   # field obj ptr awaiting post-battle reset
+        # ── deathlink (see worlds/ff7/DeathLink.py) ──────────────────────────
+        self._pending_kill: Optional[str] = None       # inbound death, applied in battle
+        self._deathlink_kill_time: float = 0.0         # when we last applied an inbound kill
+        self._death_sent_this_over: bool = False       # one outbound send per game over
         # Free Roam game-over recovery: latched when the live module hits the
         # Game Over screen (26); once gameplay resumes for a few stable ticks we
         # re-deliver every received item, because the game over reloaded the
         # wiped md1stin baseline. _resume_debounce counts the post-resume ticks.
         self._game_over_seen: bool = False
         self._resume_debounce: int = 0
+        # Delivery queue gate: items are only flushed to game memory while the
+        # player is in the FIELD or WORLD module for two consecutive polls.
+        # Battle and menu modules keep their own working copies of inventory/
+        # party state and write them back over the savemap on exit, silently
+        # losing anything the client wrote mid-module. _last_module tracks the
+        # module byte across polls; _delivery_held_logged de-spams the hold log.
+        self._last_module: Optional[int] = None
+        self._delivery_held_logged: bool = False
+        # Latched once per battle after the ally limit menus are checked/rebuilt;
+        # reset whenever the module leaves battle.
+        self._battle_limit_fixed: bool = False
         # Boss checks that have been sent (location_id)
         self._boss_checks_sent: Set[int] = set()
         # Weapon-boss kill latched from a battle formation, applied to
@@ -862,13 +960,41 @@ class FF7Context(CommonContext):
                     )
             else:
                 self._load_shops_from_json()
+            # deathlink / traplink: enable via connection tags. the flags come from
+            # slot_data["options"], and on_package is sync so the ConnectUpdate is
+            # scheduled as a task.
+            opts = sd.get("options", {})
+            if opts.get("death_link"):
+                self.tags.add("DeathLink")
+            if opts.get("trap_link"):
+                self.tags.add("TrapLink")
+            if "DeathLink" in self.tags or "TrapLink" in self.tags:
+                async_start(self.send_msgs([{"cmd": "ConnectUpdate", "tags": list(self.tags)}]),
+                            name="ff7-link-tags")
+        elif cmd == "Bounced":
+            from worlds.ff7.TrapLink import handle_bounced
+            handle_bounced(self, args)
         elif cmd == "ReceivedItems":
-            # Queue items for delivery on the next game_watcher tick
+            # Queue items for delivery on the next in-field game_watcher tick.
+            # Register names immediately (not at delivery) so gates that read
+            # _received_item_names — crater lock, character counts — don't lag
+            # behind while deliveries are held for the field module.
             index = args.get("index", 0)
+            code_map = _get_code_to_item_name()
             for offset, net_item in enumerate(args.get("items", [])):
                 item_index = index + offset
                 if item_index not in self._delivered_item_indices:
                     self._pending_items.append((item_index, net_item))
+                item_code = getattr(net_item, "item", None)
+                item_name = (code_map.get(item_code) if isinstance(item_code, int)
+                             else item_code if isinstance(item_code, str) else None)
+                if item_name:
+                    self._received_item_names.add(item_name)
+
+    def on_deathlink(self, data: dict) -> None:
+        """inbound deathlink: kill a random party member on the next battle tick."""
+        super().on_deathlink(data)          # updates last_death_link + logs
+        self._pending_kill = data.get("cause") or f"death from {data.get('source', 'another world')}"
 
     def _load_biton_map_from_json(self) -> None:
         """Load BITON coordinates from the stored Archipelago JSON path."""
@@ -880,7 +1006,7 @@ class FF7Context(CommonContext):
             )
             return
         try:
-            data = json.loads(json_path.read_text(encoding="utf-8"))
+            data = _read_apff7_json(json_path)
             self.biton_map = _biton_map_from_placements(data.get("placements", []))
             self.shop_token_to_location, self.shop_materia_to_location, \
                 self._shop_apff7_names, self._shop_apff7_materia_names, \
@@ -899,7 +1025,7 @@ class FF7Context(CommonContext):
         if json_path is None or not json_path.exists():
             return
         try:
-            data = json.loads(json_path.read_text(encoding="utf-8"))
+            data = _read_apff7_json(json_path)
             self.shop_token_to_location, self.shop_materia_to_location, \
                 self._shop_apff7_names, self._shop_apff7_materia_names, \
                 self._shop_apff7_descs, self._shop_apff7_materia_descs = \
@@ -1005,6 +1131,22 @@ KEY_ITEM_FLAGS: Dict[str, List[Tuple[int, int]]] = {
     "Huge Materia (Corel)":       [(0x42, 5)],
     "Huge Materia (Underwater)":  [(0x42, 6)],
     "Huge Materia (Rocket)":      [(0x42, 7)],
+    # Town gating (town_gating option): each town key sets a FREE savemap bit that the
+    # world-map ENTER_FIELD gate checks (Gold Saucer inserts PUSH_SAVEMAP_BIT). rel
+    # 0x184/0x185 (= 0xD28/0xD29 in bank 3, by crater_lock 0xD27; outside the
+    # key-items menu region -> no phantom menu entry). MUST match GS patchTownGates:
+    # bitIndex = relByte*8 + bit (0x184.0 -> 0xC20 Fort Condor ... 0x185.2 -> 0xC2A).
+    "Fort Condor Key":            [(0x184, 0)],
+    "Junon Key":                  [(0x184, 1)],
+    "North Corel Key":            [(0x184, 2)],
+    "Cosmo Canyon Key":           [(0x184, 3)],
+    "Nibelheim Key":              [(0x184, 4)],
+    "Rocket Town Key":            [(0x184, 5)],
+    "Wutai Key":                  [(0x184, 6)],
+    "Icicle Inn Key":             [(0x184, 7)],
+    "Mideel Key":                 [(0x185, 0)],
+    "Gongaga Key":                [(0x185, 1)],
+    "Bone Village Key":           [(0x185, 2)],
     # 0x43
     "Key to Ancients":            [(0x43, 0)],
     "Letter to a Daughter":       [(0x43, 1)],
@@ -1170,15 +1312,19 @@ _VEHICLE_FIXED_POS: Dict[int, Tuple[int, int, int]] = {
     # Highwind — player position captured via /wdump (X, Z, Y). The Highwind's
     # model renders fine at this game state; it just needs positioning off (0,0).
     3: (200728, 315, 115347),
-    # Submarine — accessible surface spot captured via /wdump (X, Z, Y).
-    13: (170091, -240, 149648),
+    # Submarine — Junon dock surface spot, captured live from a player-parked
+    # sub (2026-07-09). The previous spot (170091, 149648) was ~200 units off
+    # and clipped the sub into the dock geometry (stuck on delivery).
+    13: (169884, -240, 149694),
 }
 # Model ids safe to drop on the player's position (flying vehicles only).
 _VEHICLE_PLAYER_OK: frozenset = frozenset()
 
 # (X, Y) spots earlier client builds wrongly spawned vehicles at; a queued
 # vehicle found here is migrated to its proper target.
-_VEHICLE_LEGACY_BAD_SPOTS: frozenset = frozenset()
+_VEHICLE_LEGACY_BAD_SPOTS: frozenset = frozenset({
+    (170091, 149648),   # old Submarine spawn — clipped into the Junon dock
+})
 
 # Savemap parked-vehicle coord slots (FF7SLOT offsets) by model id. The game
 # spawns the parked vehicle's MODEL from the id packed into this coord.
@@ -1276,6 +1422,27 @@ def _enforce_crater_lock(pm: "pymem.Pymem", ctx: "FF7Context") -> None:
                 logger.debug("Northern Crater unlocked — all goal items received.")
     except Exception as exc:
         logger.debug(f"crater lock write failed: {exc}")
+
+
+def _suppress_diamond_scene(pm: "pymem.Pymem", ctx: "FF7Context") -> None:
+    """Keep savemap 0xEF6 bit 3 ("Diamond Weapon is marching on Midgar") clear in
+    Free Roam. Visiting Bone Village + the Forgotten City sets it, and the ENGINE
+    (not the world script) then arms the disc-2 Diamond scene on the next Highwind
+    touch: camera rise cinematic + forced ENTER_FIELD — resuming System fn 30's
+    body PAST its entry, so no wm0.ev head patch can stop it. Clearing the arming
+    flag kills the whole sequence at the source (verified live 2026-07-07).
+    Bit-surgical: 0xEF6 bit 0 is the Underwater Huge Materia location flag —
+    never touch the rest of the byte."""
+    if not ctx.free_roam:
+        return
+    try:
+        addr = SAVEMAP_BASE + 0x0EF6
+        val = pm.read_uchar(addr)
+        if val & 0x08:
+            pm.write_uchar(addr, val & ~0x08)
+            logger.debug("Cleared Diamond-scene arming flag (savemap 0xEF6 bit 3)")
+    except Exception as exc:
+        logger.debug(f"diamond scene suppress failed: {exc}")
 
 
 def _resolve_ultimate_weapon(pm: "pymem.Pymem", feature_on: bool) -> None:
@@ -1500,7 +1667,7 @@ _DW_RUBY_LISTS = ((0x96B120 + 9 * 0x14, 0x96DF10 + 7 * 0x20),
 
 # WEAPON Arrival: progressive spawner item. copy 1 = Diamond, 2 = Ultimate,
 # 3 = Ruby, 4 = Emerald. legacy seeds (no slot_data flag) spawn everything.
-WEAPON_ARRIVAL_ITEM_CODE = 300610
+WEAPON_ARRIVAL_ITEM_CODE = 300618
 # client-owned savemap bits read by the patched world-script loader gates:
 # Ultimate's wm0 load gate = 0xF29.bit2, Emerald's wm2 load gate = 0xF2B.bit6.
 ULTIMATE_ARRIVAL_ADDR, ULTIMATE_ARRIVAL_MASK = 0x0F29, 0x04
@@ -1769,16 +1936,17 @@ def _resolve_diamond_weapon(ctx, pm: "pymem.Pymem") -> None:
 
 
 def _resolve_weapon_battles(ctx, pm: "pymem.Pymem") -> None:
-    """Register Ruby/Emerald Weapon kills in Free Roam by watching battles.
+    """Register Ultimate/Ruby/Emerald Weapon kills in Free Roam by watching battles.
 
-    Their defeat flags (weapons_killed bit3=Ruby, bit4=Emerald) are set by
-    post-battle world-script logic that the Free Roam endgame state skips, so a
-    WON fight leaves the flag clear: the AP check never fires and the weapon
+    Their defeat flags (weapons_killed bit0=Ultimate, bit3=Ruby, bit4=Emerald) are
+    set by post-battle world-script logic that the Free Roam endgame state skips, so
+    a WON fight leaves the flag clear: the AP check never fires and the weapon
     keeps respawning. We watch the live game module + battle formation id; while
-    the player is in a Ruby/Emerald battle we latch the kill, and once they
-    return to gameplay (World/Field, i.e. they won — not a Game Over) we set the
-    bit. Acts ONLY on the exact weapon formation ids, so a wrong/garbage
-    formation read can never false-trigger a kill."""
+    the player is in a weapon battle we latch the kill, and once they return to
+    gameplay (World/Field, i.e. they won — not a Game Over) we set the bit. Acts
+    ONLY on the exact weapon formation ids, so a wrong/garbage formation read can
+    never false-trigger a kill. (_resolve_ultimate_weapon then reacts to bit0 to
+    push the post-Ultimate world state so Ruby renders.)"""
     try:
         module = pm.read_uchar(GAME_MODULE_ADDR)
         if module == GAME_MODULE_BATTLE:
@@ -1868,7 +2036,7 @@ _CHOCO_TYPES = {
 CHOCOBO_ITEM_NAMES = frozenset(_CHOCO_TYPES)
 
 
-def _deliver_chocobo(pm: "pymem.Pymem", item_name: str) -> bool:
+def _deliver_chocobo(pm: "pymem.Pymem", item_name: str, sender: str = "") -> bool:
     """Place a bred chocobo of the given colour into the next free Chocobo Farm
     stable slot.
 
@@ -1916,8 +2084,9 @@ def _deliver_chocobo(pm: "pymem.Pymem", item_name: str) -> bool:
         # Per-chocobo extras (parallel arrays, indexed by slot).
         pm.write_ushort(base + _CHOCO_STAMINA0 + free_slot * 2, 1000)
         pm.write_uchar (base + _CHOCO_RATING0 + free_slot, 1)        # Wonderful
-        for i in range(6):                                          # empty (default) name
-            pm.write_uchar(base + _CHOCO_NAME0 + free_slot * 6 + i, 0xFF)
+        # name it after the ap player who found it (empty sender = blank name)
+        for i, b in enumerate(_encode_ff7_name(sender, width=6)):
+            pm.write_uchar(base + _CHOCO_NAME0 + free_slot * 6 + i, b)
         # Stable bookkeeping: mark this slot occupied; own ≥ occupied stables.
         mask |= (1 << free_slot)
         pm.write_uchar(base + _CHOCO_MASK, mask)
@@ -1935,7 +2104,7 @@ def _deliver_chocobo(pm: "pymem.Pymem", item_name: str) -> bool:
 # ── Party member delivery (Free Roam: unlock optional characters) ─────────────
 # Savemap char roster order: Cloud,Barret,Tifa,Aerith,RedXIII,Yuffie,CaitSith,
 # Vincent,Cid -> ids 0..8. PHS availability is a per-id bitmask.
-_CHARACTER_IDS = {"Barret": 1, "Tifa": 2, "Aerith": 3, "Red XIII": 4, "Cait Sith": 6, "Cid": 8}
+_CHARACTER_IDS = {"Barret": 1, "Tifa": 2, "Aerith": 3, "Red XIII": 4, "Cait Sith": 6, "Cid": 8, "Vincent": 7}
 _PARTY_OFFSET       = 0x04F8   # qint8 party[3] — active party member ids
 # PHS bitmasks (per character id). 0x10A4 is the LOCK mask (ff7-ultima
 # party_locking_mask): a SET bit forces the member in place / blocks swapping.
@@ -1956,7 +2125,8 @@ _CHAR_RECORD_SIZE   = 132      # bytes per character record (FF7CHAR)
 
 # Default in-game names per character id (FF7's initial-data names).
 _CHAR_DEFAULT_NAMES = {
-    1: "Barret", 2: "Tifa", 3: "Aeris", 4: "Red XIII", 6: "Cait Sith", 8: "Cid",
+    1: "Barret", 2: "Tifa", 3: "Aeris", 4: "Red XIII", 5: "Yuffie",
+    6: "Cait Sith", 7: "Vincent", 8: "Cid",
 }
 # First (default) weapon index per character id — the byte stored in FF7CHAR
 # +0x1C. Each character may only equip weapons in their own range, so a delivered
@@ -2013,7 +2183,7 @@ def _init_character_record(pm: "pymem.Pymem", cid: int) -> None:
     rec[_CHR_ARMOR] = random.randint(0x00, 0x1F)   # random valid armor (NOT 0xFF)
     rec[_CHR_ACCESSORY] = 0xFF      # no accessory (0xFF is a valid empty accessory)
     rec[_CHR_STATUS] = 0x00         # normal (clear sadness/fury)
-    rec[_CHR_ROW] = 0x01            # front row
+    rec[_CHR_ROW] = 0xFF            # front row (0xFF front / 0xFE back — 0x01 is invalid)
     # Limit state: a cloned/uninitialised limit LEVEL can point at a limit the
     # character hasn't learned, which softlocks battle when the gauge fills (the
     # player's workaround is to set it to Level 1 in the menu). Seed a clean
@@ -2068,6 +2238,67 @@ def _ensure_character_record(pm: "pymem.Pymem", cid: int) -> bool:
     return False
 
 
+# Game functions that rebuild the engine's party-member data after the party
+# composition changes (same 2013 exe map as everything else; addresses from
+# ff7-ultima's setPartyMemberSlot, which performs the identical slot write we
+# do and then calls exactly these two). The engine resolves each member's
+# LIMIT TECHNIQUE LIST here — a raw party-slot byte write without this rebuild
+# leaves the limit list empty (gauge fills, no techniques) until any menu
+# limit-set triggers the same rebuild. 0x6cd13a() is the global party refresh;
+# 0x6c545b(slot) rebuilds one member's data.
+_PARTY_REFRESH_FN = 0x6CD13A
+_PARTY_BUILD_MEMBER_FN = 0x6C545B
+
+# Battle-side limit-menu rebuild. A party member inserted by the client (raw
+# party-slot write) enters every battle with an unbuilt limit command: the
+# gauge fills but pressing Limit shows nothing (no pink box). The engine's own
+# ally-limit rebuild fn 0x434df3(slot) fixes it (found via ff7-ultima; verified
+# in-game across multiple battles). The broken state is detectable per battle:
+# party_objects[slot]+0x48 (a limit-parameter pair populated by the game's own
+# party-add path) reads 0. battle_char_array[slot]+0x00 holds the member's
+# savemap char-record pointer; +0x08 is the battle limit gauge, saved/restored
+# around the call in case the rebuild force-fills it.
+_BATTLE_LIMIT_REBUILD_FN = 0x434DF3
+_BATTLE_CHAR_ARRAY = 0x9A8DB8      # stride 0x34
+_BATTLE_CHAR_ARRAY_STRIDE = 0x34
+_PARTY_OBJECTS = 0xDBA498          # stride 0x440
+_PARTY_OBJECTS_STRIDE = 0x440
+_CHAR_RECORDS_BASE = SAVEMAP_BASE + _CHARS_OFFSET
+
+
+def _fix_battle_limit_menus(pm: "pymem.Pymem", ctx: "FF7Context") -> None:
+    """Once per battle (module 2 stable), rebuild the limit command of any ally
+    whose battle object carries the broken marker (see constants above)."""
+    for slot in range(3):
+        try:
+            rec = pm.read_uint(_BATTLE_CHAR_ARRAY + slot * _BATTLE_CHAR_ARRAY_STRIDE)
+            # slot must point at a savemap char record (empty slots don't)
+            if not (_CHAR_RECORDS_BASE <= rec < _CHAR_RECORDS_BASE + 9 * _CHAR_RECORD_SIZE):
+                continue
+            pair = pm.read_uint(_PARTY_OBJECTS + slot * _PARTY_OBJECTS_STRIDE + 0x48)
+            if pair != 0:
+                continue    # limit command already built by the game
+            bar_addr = _BATTLE_CHAR_ARRAY + slot * _BATTLE_CHAR_ARRAY_STRIDE + 0x08
+            bar = pm.read_ushort(bar_addr)
+            _call_game_fn(pm, _BATTLE_LIMIT_REBUILD_FN, slot)
+            pm.write_ushort(bar_addr, bar)   # undo any force-fill from the rebuild
+            cid = pm.read_uchar(rec)
+            logger.debug(f"Rebuilt battle limit menu for slot {slot} (char id {cid})")
+        except Exception as exc:
+            logger.debug(f"battle limit rebuild failed for slot {slot}: {exc}")
+
+
+def _call_game_fn(pm: "pymem.Pymem", address: int, param: Optional[int] = None) -> None:
+    """Run a game function on a remote thread. CreateRemoteThread's lpParameter
+    lands as the callee's first stack argument, which covers the zero/one-arg
+    cdecl functions we call. Waits briefly so calls execute in order."""
+    import ctypes
+    thread = pm.start_thread(address, param)
+    if thread:
+        ctypes.windll.kernel32.WaitForSingleObject(thread, 1000)
+        ctypes.windll.kernel32.CloseHandle(thread)
+
+
 def _deliver_character(pm: "pymem.Pymem", char_name: str) -> bool:
     """Unlock an optional party member: make them available in the PHS, and drop
     them into an empty active party slot if one is free."""
@@ -2099,6 +2330,16 @@ def _deliver_character(pm: "pymem.Pymem", char_name: str) -> bool:
             for i in range(3):
                 if slots[i] in (0xFF, 0xFE):
                     pm.write_uchar(base + i, cid)
+                    # Rebuild the engine's party-member data (limit technique
+                    # list etc.) exactly like the game's own party-change code
+                    # does — without this the new member's limit gauge fills
+                    # but the technique list is empty until a menu limit-set.
+                    try:
+                        _call_game_fn(pm, _PARTY_REFRESH_FN)
+                        _call_game_fn(pm, _PARTY_BUILD_MEMBER_FN, i)
+                        logger.debug(f"Rebuilt party data for slot {i} ({char_name})")
+                    except Exception as exc:
+                        logger.debug(f"party rebuild call failed (non-fatal): {exc}")
                     break
         logger.debug(f"Delivered party member: {char_name}")
         return True
@@ -2146,6 +2387,58 @@ def _reward_patch_gil(v: int) -> bytes:
 
 def _reward_patch_ap(v: int) -> bytes:
     return bytes((0x6B, 0xD2, v, 0x01, 0x15, 0xC4, 0xE2, 0x99, 0x00, 0x90, 0x90, 0x90))
+
+
+def _read_field_name(pm: "pymem.Pymem") -> str:
+    """Current field's name (e.g. 'crcin_1'), or '' on failure. Null/backslash-terminated."""
+    try:
+        raw = pm.read_bytes(FIELD_NAME_ADDR, 16)
+    except Exception:
+        return ""
+    for sep in (b"\x00", b"\\"):
+        i = raw.find(sep)
+        if i >= 0:
+            raw = raw[:i]
+    try:
+        return raw.decode("ascii", "ignore")
+    except Exception:
+        return ""
+
+
+# Story fields entered out of sequence in Free Roam load some NPCs non-solid /
+# non-interactable (their field-script SOLID/VISI state doesn't stick), which blocks
+# interacting with them. Force those models solid + interactable + visible live,
+# exactly like FF7 Ultima's field-model toggle. Keyed by field name -> model indices
+# (each = the entity's CHAR-opcode operand).
+_FORCE_INTERACTABLE_MODELS: Dict[str, Tuple[int, ...]] = {
+    "crcin_1": (8,),   # esto = Ester, the Chocobo Square race manager (CHAR a1 08)
+}
+
+
+def _apply_field_model_overrides(pm: "pymem.Pymem", ctx: FF7Context) -> None:
+    """When in a field listed in _FORCE_INTERACTABLE_MODELS, force its NPC model(s)
+    solid (+0x5f=0), interactable (+0x61=0) and visible (+0x62=1). Idempotent — only
+    writes a byte that's wrong, so it costs nothing on the vast majority of polls."""
+    if not ctx.free_roam:
+        return
+    fname = _read_field_name(pm)
+    models = _FORCE_INTERACTABLE_MODELS.get(fname)
+    if not models:
+        return
+    for idx in models:
+        base = FIELD_MODELS_OBJS + idx * _FIELD_MODEL_STRUCT_SIZE
+        try:
+            changed = False
+            if pm.read_uchar(base + 0x5f) != 0:
+                pm.write_uchar(base + 0x5f, 0); changed = True   # collision ON (solid)
+            if pm.read_uchar(base + 0x61) != 0:
+                pm.write_uchar(base + 0x61, 0); changed = True   # interaction ON (talkable)
+            if pm.read_uchar(base + 0x62) != 1:
+                pm.write_uchar(base + 0x62, 1); changed = True   # visible
+            if changed:
+                logger.debug(f"Forced field model {idx} solid/interactable/visible in {fname}")
+        except Exception:
+            pass
 
 
 def _apply_reward_multipliers(pm: "pymem.Pymem", ctx: FF7Context) -> None:
@@ -2208,25 +2501,109 @@ def _requeue_all_received_items(ctx: "FF7Context") -> int:
     the next delivery pass re-applies everything. Used by the Free Roam
     game-over recovery and the ``/resync`` command: a game over reloads the
     md1stin baseline and wipes every client-delivered item, so re-delivery
-    restores them. This is a correct *restore* only when the savemap was
-    actually wiped (inventory empty). Flag-type deliveries (key items,
-    vehicles, party members, chocobos) are idempotent, but stackable items /
-    materia would duplicate if re-run with items still present — which is why
-    the auto path only fires after a confirmed game over.
+    restores them. Flag-type deliveries (key items, vehicles, party members,
+    chocobos) are idempotent; stackable items / materia are RECONCILED to their
+    AP-granted target (``_resync_reconcile``), so only the missing quantity is
+    added — re-syncing with items still present can no longer duplicate them.
     """
     received = list(getattr(ctx, "items_received", None) or [])
     ctx._delivered_item_indices.clear()
     ctx._pending_items = list(enumerate(received))
+    ctx._resync_reconcile = True
     return len(received)
+
+
+def _valid_char_records(pm: "pymem.Pymem"):
+    """Yield the savemap record base of every INITIALISED character (id byte
+    matches the slot). Skips optional-character templates (Cait Sith/Vincent
+    slots hold Young Cloud/Sephiroth ids 9/10 until delivered) so their
+    placeholder equipment is never counted as player-owned."""
+    for cid in range(9):
+        rec = SAVEMAP_BASE + _CHARS_OFFSET + cid * _CHAR_RECORD_SIZE
+        try:
+            if pm.read_uchar(rec + _CHR_ID) == cid:
+                yield rec
+        except Exception:
+            return
+
+
+def _count_item_qty(pm: "pymem.Pymem", ff7_id: int) -> int:
+    """Total quantity of ff7_id currently owned: item inventory PLUS gear
+    equipped on characters (weapon/armor/accessory) — otherwise a resync
+    counts equipped AP gear as missing and duplicates it."""
+    base = SAVEMAP_BASE + ITEM_LIST_OFFSET
+    total = 0
+    for slot in range(ITEM_SLOT_COUNT):
+        word = pm.read_ushort(base + slot * 2)
+        if word != EMPTY_ITEM_WORD and (word & 0x1FF) == ff7_id:
+            total += (word >> 9) & 0x7F
+    # equipped gear (composite ids: weapons 128+n, armor 256+n, accessory 288+n)
+    for rec in _valid_char_records(pm):
+        w = pm.read_uchar(rec + _CHR_WEAPON)
+        a = pm.read_uchar(rec + _CHR_ARMOR)
+        acc = pm.read_uchar(rec + _CHR_ACCESSORY)
+        if w != 0xFF and 128 + w == ff7_id:
+            total += 1
+        if a != 0xFF and 256 + a == ff7_id:
+            total += 1
+        if acc != 0xFF and 288 + acc == ff7_id:
+            total += 1
+    return total
+
+
+def _count_materia_qty(pm: "pymem.Pymem", ff7_id: int) -> int:
+    """Number of materia of ff7_id currently owned: materia inventory PLUS
+    materia socketed in every character's weapon/armor slots (16 × 4 bytes at
+    rec+0x40) — otherwise a resync counts equipped AP materia as missing and
+    duplicates it."""
+    base = SAVEMAP_BASE + MATERIA_LIST_OFFSET
+    count = 0
+    for slot in range(MATERIA_SLOT_COUNT):
+        if pm.read_uchar(base + slot * 4) == ff7_id:
+            count += 1
+    for rec in _valid_char_records(pm):
+        equipped = pm.read_bytes(rec + _CHR_MATERIA, 16 * 4)
+        for s in range(16):
+            if equipped[s * 4] == ff7_id:
+                count += 1
+    return count
 
 
 def _deliver_items_to_game(pm: "pymem.Pymem", ctx: FF7Context) -> None:
     """Drain ctx._pending_items and write each one to FF7 memory."""
+    from worlds.ff7.TrapLink import TRAP_REGISTRY
+
     if not ctx._pending_items:
         return
 
     still_pending: List[Tuple[int, object]] = []
     code_map = _get_code_to_item_name()
+
+    # Resync/game-over re-delivery: precompute the AP-granted target quantity of
+    # each stackable item / materia (from the full items_received), so below we
+    # add only the deficit vs current inventory instead of stacking on top of
+    # whatever survived. Flag-type items (key/vehicle/char/chocobo) are idempotent
+    # and skipped here. Normal incremental delivery (flag off) stays additive.
+    item_targets: Dict[int, int] = {}
+    materia_targets: Dict[int, int] = {}
+    if ctx._resync_reconcile:
+        for _net in (getattr(ctx, "items_received", None) or []):
+            _code = getattr(_net, "item", None)
+            _nm = code_map.get(_code) if isinstance(_code, int) else (_code if isinstance(_code, str) else None)
+            if not _nm:
+                continue
+            if (_nm in CHOCOBO_ITEM_NAMES or _nm in VEHICLE_ITEM_FLAGS
+                    or _nm in _CHARACTER_IDS or _nm in KEY_ITEM_FLAGS):
+                continue
+            _r = _item_name_to_ff7_id(_nm)
+            if _r is None:
+                continue
+            _cat, _fid = _r
+            if _cat == "materia":
+                materia_targets[_fid] = materia_targets.get(_fid, 0) + 1
+            else:
+                item_targets[_fid] = item_targets.get(_fid, 0) + 1
+
     for item_index, net_item in ctx._pending_items:
         item_code = getattr(net_item, "item", None)
         if isinstance(item_code, int):
@@ -2241,8 +2618,19 @@ def _deliver_items_to_game(pm: "pymem.Pymem", ctx: FF7Context) -> None:
 
         ctx._received_item_names.add(item_name)  # for the Northern Crater gate
 
+        # traps route into the trap queue instead of the inventory. _seen_trap_indices
+        # fires each received trap once, even across a game-over re-deliver.
+        if item_name in TRAP_REGISTRY:
+            if item_index not in ctx._seen_trap_indices:
+                ctx._trap_queue.append(TRAP_REGISTRY[item_name])
+                ctx._seen_trap_indices.add(item_index)
+                logger.info(f"Trap received: {item_name} (queued).")
+            ctx._delivered_item_indices.add(item_index)
+            continue
+
         if item_name in CHOCOBO_ITEM_NAMES:
-            if _deliver_chocobo(pm, item_name):
+            sender = ctx.player_names.get(getattr(net_item, "player", None), "")
+            if _deliver_chocobo(pm, item_name, sender):
                 ctx._delivered_item_indices.add(item_index)
             else:
                 still_pending.append((item_index, net_item))
@@ -2292,10 +2680,22 @@ def _deliver_items_to_game(pm: "pymem.Pymem", ctx: FF7Context) -> None:
         category, ff7_id = result
         try:
             if category == "materia":
-                _write_materia(pm, ff7_id)
+                if ctx._resync_reconcile:
+                    # add only the missing count (reading current fresh means the
+                    # first index of a type adds the deficit, later ones add 0)
+                    deficit = materia_targets.get(ff7_id, 0) - _count_materia_qty(pm, ff7_id)
+                    for _ in range(max(0, deficit)):
+                        _write_materia(pm, ff7_id)
+                else:
+                    _write_materia(pm, ff7_id)
             else:
                 # items / weapons / armors / accessories all go in the item list
-                _write_item(pm, ff7_id)
+                if ctx._resync_reconcile:
+                    deficit = item_targets.get(ff7_id, 0) - _count_item_qty(pm, ff7_id)
+                    if deficit > 0:
+                        _write_item(pm, ff7_id, deficit)
+                else:
+                    _write_item(pm, ff7_id)
             ctx._delivered_item_indices.add(item_index)
             logger.debug(f"Delivered item: {item_name} (ff7_id={ff7_id})")
         except Exception as exc:
@@ -2303,6 +2703,9 @@ def _deliver_items_to_game(pm: "pymem.Pymem", ctx: FF7Context) -> None:
             still_pending.append((item_index, net_item))
 
     ctx._pending_items = still_pending
+    # Reconcile mode ends once the full re-delivery has drained.
+    if not still_pending:
+        ctx._resync_reconcile = False
 
 
 def _write_item(pm: "pymem.Pymem", ff7_id: int, qty: int = 1) -> None:
@@ -2431,6 +2834,9 @@ def _strip_token_materia(pm: "pymem.Pymem", ctx: "FF7Context") -> None:
 
 async def game_watcher(ctx: FF7Context) -> None:
     """Poll FF7's in-memory Savemap; send LocationChecks when BITON flags flip."""
+    from worlds.ff7.DeathLink import apply_pending_kill, pump_outbound
+    from worlds.ff7.TrapLink import pump_trap_queue
+
     if not _PYMEM_AVAILABLE:
         logger.warning(
             "pymem is not installed — FF7 memory reading is disabled.\n"
@@ -2530,6 +2936,10 @@ async def game_watcher(ctx: FF7Context) -> None:
         # ── Battle reward multipliers (one-time exe patch once connected) ──
         _apply_reward_multipliers(pm, ctx)
 
+        # ── Force story-field NPCs interactable in Free Roam (e.g. Ester in the
+        # Chocobo Square) so the player can actually talk to them. ──
+        _apply_field_model_overrides(pm, ctx)
+
         # ── Free Roam game-over redundancy ─────────────────────────────────
         # A game over reloads the md1stin baseline, wiping every client-
         # delivered AP item (key items, vehicles, party, chocobos, inventory).
@@ -2542,6 +2952,8 @@ async def game_watcher(ctx: FF7Context) -> None:
             _module = pm.read_uchar(GAME_MODULE_ADDR)
         except Exception:
             _module = None
+        # deathlink outbound: one death per game over, re-armed on resume.
+        pump_outbound(ctx, _module)
         if _module == GAME_MODULE_GAMEOVER:
             ctx._game_over_seen = True
             ctx._resume_debounce = 0
@@ -2558,9 +2970,47 @@ async def game_watcher(ctx: FF7Context) -> None:
                         "received AP item(s)."
                     )
 
-        # ── Deliver queued items ──────────────────────────────────────────
+        # ── Deliver queued items (gameplay-module gate) ───────────────────
+        # Hold every pending AP item until the player has been in the FIELD or
+        # WORLD module for two consecutive polls (same module both ticks).
+        # Battle/menu modules operate on their own copies of inventory/party
+        # state and write them back over the savemap when they exit, so
+        # anything delivered mid-module can be silently lost. Two stable ticks
+        # also skip the module-load instant, when the engine is still
+        # (re)initialising savemap-backed state.
+        # ── Rebuild broken ally limit menus at battle start ───────────────
+        # A client-inserted party member enters battle with an unbuilt limit
+        # command (gauge fills, no technique box). Two consecutive battle polls
+        # let battle-init finish, then rebuild any slot with the broken marker.
+        if _module == GAME_MODULE_BATTLE:
+            if ctx._last_module == GAME_MODULE_BATTLE and not ctx._battle_limit_fixed:
+                _fix_battle_limit_menus(pm, ctx)
+                ctx._battle_limit_fixed = True
+        else:
+            ctx._battle_limit_fixed = False
+
         if ctx._pending_items:
-            _deliver_items_to_game(pm, ctx)
+            _in_gameplay = (_module in (GAME_MODULE_FIELD, GAME_MODULE_WORLD)
+                            and ctx._last_module == _module)
+            if _in_gameplay:
+                if ctx._delivery_held_logged:
+                    logger.debug(
+                        f"Gameplay module stable (module={_module}) — flushing "
+                        f"{len(ctx._pending_items)} held AP item(s)."
+                    )
+                ctx._delivery_held_logged = False
+                _deliver_items_to_game(pm, ctx)
+            elif not ctx._delivery_held_logged:
+                ctx._delivery_held_logged = True
+                logger.debug(
+                    f"Holding {len(ctx._pending_items)} AP item(s) until the "
+                    f"player is in the field or world module (module={_module})."
+                )
+        ctx._last_module = _module
+
+        # ── trap queue + inbound deathlink ────────────────────────────────
+        apply_pending_kill(pm, ctx)
+        pump_trap_queue(pm, ctx)
 
         # ── Read savemap and check flags ──────────────────────────────────
         try:
@@ -2640,6 +3090,9 @@ async def game_watcher(ctx: FF7Context) -> None:
 
             # ── Drive the Northern Crater gate flag from received goal items ───
             _enforce_crater_lock(pm, ctx)
+
+            # ── Free Roam: disarm the engine-driven Diamond Highwind scene ─────
+            _suppress_diamond_scene(pm, ctx)
 
             # ── Free Roam: finish Ultimate Weapon once the player has engaged him ─
             if ctx.free_roam:
