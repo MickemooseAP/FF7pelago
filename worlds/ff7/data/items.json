@@ -1093,7 +1093,7 @@
     "ff7_id": 253
   },
   {
-    "name": "Pahsan Greens",
+    "name": "Pahsana Greens",
     "code": 100183,
     "classification": "filler",
     "ff7_id": 66
@@ -2806,7 +2806,7 @@
   },
   {
     "name": "WEAPON Arrival",
-    "code": 300618,
+    "code": 300620,
     "classification": "progression",
     "category": "key_item",
     "count": 4
@@ -2814,6 +2814,13 @@
   {
     "name": "Vincent",
     "code": 300617,
+    "classification": "progression",
+    "category": "character",
+    "count": 1
+  },
+  {
+    "name": "Yuffie",
+    "code": 300619,
     "classification": "progression",
     "category": "character",
     "count": 1
@@ -2891,6 +2898,13 @@
   {
     "name": "Bone Village Key",
     "code": 300616,
+    "classification": "progression",
+    "category": "key_item",
+    "count": 1
+  },
+  {
+    "name": "Costa del Sol Key",
+    "code": 300618,
     "classification": "progression",
     "category": "key_item",
     "count": 1
