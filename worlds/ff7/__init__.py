@@ -34,6 +34,7 @@ from .Options import (
     DisableBoneVillageDigs,
     ShopSlotsPerShop,
     ProgressiveChocobos,
+    ProgressiveLimits,
     PartyLevelSync,
     WeaponFightChecks,
     TownGating,
@@ -417,6 +418,10 @@ FREE_ROAM_REGION_MAP: dict[str, str] = {
     "las1_3":     "Northern Cave",
     "las2_2":     "Northern Cave",
     "las2_3":     "Northern Cave",
+    # las2_4 holds the Counter and W-Magic materia. It was missing from this
+    # table entirely, so both locations had been filed against las0_4 -- a
+    # field with no SMTRA opcodes at all. See locations.json.
+    "las2_4":     "Northern Cave",
     "las3_1":     "Northern Cave",
     "las3_2":     "Northern Cave",
     "las3_3":     "Northern Cave",
@@ -454,6 +459,17 @@ FREE_ROAM_REGION_MAP: dict[str, str] = {
 _COLOUR_CHOCOBO_ITEMS = frozenset({
     "Green Chocobo", "Blue Chocobo", "Black Chocobo", "Gold Chocobo",
 })
+
+# Five copies each, one per playable character (Cloud included - he is the one
+# character always in the party, so his limits matter most). Classified
+# `useful`, and deliberately absent from every access rule: limits make fights
+# easier, they do not open regions, and putting 45 items into logic would
+# tighten fill for no gain in reachability.
+_PROGRESSIVE_LIMIT_ITEMS = frozenset(
+    f"Progressive Limit ({name})" for name in
+    ("Cloud", "Barret", "Tifa", "Aerith", "Red XIII",
+     "Yuffie", "Cait Sith", "Vincent", "Cid")
+)
 
 _FREE_ROAM_ONLY_ITEMS = frozenset({
     "Highwind", "Submarine",
@@ -814,7 +830,7 @@ _TOWN_GATE_KEYS = {
     "Bone Village": "Bone Village Key",
     "Costa del Sol": "Costa del Sol Key",
     # The Sleeping Forest (and everything past it) is Bone Village's back yard:
-    # its only world entrances are the Corral Valley strip, which Gold Saucer
+    # its only world entrances are the Corel Valley strip, which Gold Saucer
     # seals on the same key, so the whole northern chain flows through Bone
     # Village. (Forgotten Capital / Corel Valley additionally need the Lunar
     # Harp — their entrance rules AND the key in directly, see
@@ -892,6 +908,7 @@ class FF7Web(WebWorld):
                 # Directly under RandomizeShops: meaningless without it.
                 ShopSlotsPerShop,
                 ProgressiveChocobos,
+                ProgressiveLimits,
                 RandomizeStartingEquipment,
                 StartingEquipmentTier,
             ],
@@ -1378,11 +1395,40 @@ class FF7World(World):
         # deliberately. The point is that the dependency is now STRUCTURAL: if the
         # event is ever tightened, this tightens with it instead of quietly
         # continuing to disagree with its own comment.
-        world_map.connect(sub_regions["Ancient Forest"]).access_rule = (
-            lambda state: (_black(state) or _gold(state)
-                    or (_highwind(state)
-                        and state.has("Ultimate Weapon Defeated", player)))
-        )
+        # The Highwind route exists ONLY when weapon_fight_checks is on
+        # (changed by request 2026-09-06). It runs through "Ultimate Weapon
+        # Defeated", and fill can never see a battle outcome — the event really
+        # means "you are equipped to go and kill Ultimate", not that you did. With
+        # the checks ON the player at least has a check telling them the fight
+        # matters; with them OFF nothing points at Ultimate at all, so a tracker
+        # would show the forest open while the plateau is still shut, and the
+        # player has no reason to guess why.
+        #
+        # The chocobo routes are unchanged: Black and Gold climb to the plateau
+        # directly, which is why they never needed the event.
+        #
+        # The event itself stays UNCONDITIONAL — see uw_event below. Making its
+        # creation depend on the option is the exact bug that silently reshaped
+        # this rule once already; with checks off it is simply unreferenced, and
+        # an unreferenced event costs nothing (code=None plus a locked item).
+        # The chocobo half, shared by both branches. Black and Gold climb to the
+        # plateau on their own. GREEN climbs it too, but cannot cross the ocean to
+        # get there, so it needs the Highwind to ferry it — the same pattern as the
+        # Mime Cave, and confirmed in play 2026-09-06.
+        def _ancient_forest_chocobo(state):
+            return (_black(state) or _gold(state)
+                    or (_green(state) and _highwind(state)))
+
+        if bool(self.options.weapon_fight_checks):
+            world_map.connect(sub_regions["Ancient Forest"]).access_rule = (
+                lambda state: (_ancient_forest_chocobo(state)
+                        or (_highwind(state)
+                            and state.has("Ultimate Weapon Defeated", player)))
+            )
+        else:
+            world_map.connect(sub_regions["Ancient Forest"]).access_rule = (
+                lambda state: _ancient_forest_chocobo(state)
+            )
         # Temple of the Ancients (v0.0.6): its own island, so ocean traversal, plus
         # the Keystone. The Keystone requirement is REAL, not just logical — nothing
         # in the temple's scripts checks for it (vanilla relies on the story), so the
@@ -1402,7 +1448,7 @@ class FF7World(World):
         )
         # Northern forests past Sleeping Forest need the Lunar Harp — and, with
         # town gating, the Bone Village Key: their only world entrances (the
-        # Corral Valley strip, tbl#26/#57/#58) are sealed by Gold Saucer on the
+        # Corel Valley strip, tbl#26/#57/#58) are sealed by Gold Saucer on the
         # Bone Village key bit, so the whole area is reached through Bone
         # Village -> Sleeping Forest.
         _tg = bool(self.options.town_gating)
@@ -1442,13 +1488,28 @@ class FF7World(World):
             and state.has("Glacier Map", player)
         )
 
-        # --- Northern Crater interior: Highwind + All Characters + 4 Huge Materia ---
+        # --- Northern Crater interior: Highwind + 4 Huge Materia ---
+        # The BARRIER is the Huge Materia and nothing else (changed by request
+        # 2026-09-07). The party requirement moved DEEPER, to las4_1 -- the game's
+        # own point of no return -- so the crater's own checks are reachable with
+        # the materia alone and only the final descent wants a full party.
+        # Gold Saucer enforces it there by locking walkmesh triangle 81 on entry
+        # whenever the party byte is clear, so the way on is physically absent.
+        # Highwind stays: it is how you physically reach the crater, not part of
+        # the barrier.
         world_map.connect(sub_regions["Whirlwind Maze"]).access_rule = _has("Highwind")
         world_map.connect(sub_regions["Northern Cave"]).access_rule = (
             lambda state: (
                 state.has("Highwind", player)
-                and state.has_all(_PARTY_MEMBER_ITEMS, player)
                 and state.has_all(_GOAL_HUGE_MATERIA, player)
+                # ...and a real squad, exactly as the Gelnika and the Underwater
+                # Reactor want one (request 2026-09-08). The crater's interior is
+                # deep-endgame content and a solo Cloud has no business in it; the
+                # Huge Materia say you are ALLOWED in, party size says you are
+                # equipped for it. Counted, not named, so Vincent and Yuffie
+                # qualify - this is about combat strength, unlike the point of no
+                # return at las4_1, which wants the canonical six by name.
+                and _squad(state)
             )
         )
 
@@ -1635,9 +1696,10 @@ class FF7World(World):
                 world_map.locations.append(boss_loc)
 
         victory_loc = FF7Location(player, self.victory_location_name, None, world_map)
-        # Gate the goal so winning requires real endgame progression: the
-        # Highwind (Northern Crater access), the full party (all 6 recruited),
-        # and all 4 Huge Materia.
+        # The goal still wants everything, but the two halves are now enforced in
+        # different places in game: the Huge Materia lower the barrier, and the
+        # full party is checked at las4_1, the point of no return. Logic keeps
+        # them together here because beating Sephiroth requires passing both.
         victory_loc.access_rule = lambda state: (
             state.has("Highwind", player)
             and state.has_all(_PARTY_MEMBER_ITEMS, player)
@@ -1652,6 +1714,8 @@ class FF7World(World):
         free_roam = bool(self.options.free_roam)
         town_gating = free_roam and bool(self.options.town_gating)
         progressive_chocobos = free_roam and bool(self.options.progressive_chocobos)
+        # Not Free-Roam-gated: limits work the same in both modes.
+        progressive_limits = bool(self.options.progressive_limits)
         # Count only locations that still need an item. The victory location is
         # pre-filled with a locked item in create_regions; counting it here would
         # create one item too many for the available spots and break fill.
@@ -1683,6 +1747,10 @@ class FF7World(World):
             if progressive_chocobos and name in _COLOUR_CHOCOBO_ITEMS:
                 continue
             if not progressive_chocobos and name == "Progressive Chocobo":
+                continue
+            # With the option off, limits unlock the vanilla way and these items
+            # have nothing to grant.
+            if not progressive_limits and name in _PROGRESSIVE_LIMIT_ITEMS:
                 continue
             pool_names.extend([name] * data.count)
 
@@ -1902,6 +1970,11 @@ class FF7World(World):
             "shops": exporter._serialize_shops(),
             "victory_condition": 0,   # legacy client fallback; goals is the real goal
             "free_roam": bool(self.options.free_roam),
+            # The client needs this to know whether to SUPPRESS the game's own
+            # limit teaching. Without the flag it cannot tell an option-off seed
+            # (leave the game alone) from an option-on seed where no limit items
+            # have arrived yet (hold everyone at Level 1-1).
+            "progressive_limits": bool(self.options.progressive_limits),
             "exp_multiplier": int(self.options.exp_multiplier.value),
             "gil_multiplier": int(self.options.gil_multiplier.value),
             "ap_multiplier": int(self.options.ap_multiplier.value),

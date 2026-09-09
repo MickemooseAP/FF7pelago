@@ -73,11 +73,23 @@ SAVEMAP_LEN        = 0x10F4
 # entrance reads Var[3][131] and bounces the player out while it is 0.
 #   bank 3 base = 0x0CA4, Var[3][131] = 0x0CA4 + 0x83 = 0x0D27
 CRATER_LOCK_OFFSET = 0x0D27
+# The BARRIER is the four Huge Materia (plus the Highwind, which is simply how
+# you get there). The six characters moved OUT of this set on 2026-09-07 and are
+# now checked at las4_0, the point of no return -- see PARTY_GATE_OFFSET below.
 CRATER_REQUIRED_ITEMS = frozenset({
     "Highwind",
-    "Barret", "Tifa", "Aerith", "Red XIII", "Cait Sith", "Cid",
     "Huge Materia (Fort Condor)", "Huge Materia (Corel)",
     "Huge Materia (Underwater)", "Huge Materia (Rocket)",
+})
+# Party gate for las4_0. Same bank as the crater lock, next byte along:
+#   bank 3 base = 0x0CA4, Var[3][132] = 0x0CA4 + 0x84 = 0x0D28
+# The client sets it to 1 once the canonical six are recruited; the Gold Saucer
+# field gate injected into las4_0 reads it and refuses the descent while it is 0.
+# Deliberately a SEPARATE byte from the crater lock: the two requirements are now
+# enforced at different points in the game, and one flag cannot express that.
+PARTY_GATE_OFFSET = 0x0D28
+PARTY_GATE_REQUIRED_ITEMS = frozenset({
+    "Barret", "Tifa", "Aerith", "Red XIII", "Cait Sith", "Cid",
 })
 GAME_MOMENT_OFFSET = 0x0BA4   # uint16 LE "mprogress" Main Progress var
 GAME_MOMENT_GOAL   = 3000     # (legacy; mprogress actually caps at 1999, see below)
@@ -1172,50 +1184,55 @@ class FF7CommandProcessor(ClientCommandProcessor):
         return True
 
     def _cmd_gomode(self) -> bool:
-        """Show what you still need to lower the Northern Crater barrier — the
-        Highwind, the full party and all four Huge Materia."""
+        """Show what you still need to finish the game — the Huge Materia that
+        lower the Northern Crater barrier, and the party las4_0 demands."""
         received = getattr(self.ctx, "_received_item_names", set())
-        # Grouped so the output reads like a checklist rather than one long line.
-        groups = (
-            ("Highwind",     ["Highwind"]),
-            ("Party",        ["Barret", "Tifa", "Aerith", "Red XIII",
-                              "Cait Sith", "Cid"]),
-            ("Huge Materia", ["Huge Materia (Fort Condor)", "Huge Materia (Corel)",
-                              "Huge Materia (Underwater)", "Huge Materia (Rocket)"]),
-        )
 
         def _short(n: str) -> str:
             if n.startswith("Huge Materia ("):
                 return n[len("Huge Materia ("):-1]
             return n
 
-        have_all = CRATER_REQUIRED_ITEMS.issubset(received)
-        total   = len(CRATER_REQUIRED_ITEMS)
-        got     = len(CRATER_REQUIRED_ITEMS & set(received))
-        logger.info(f"[gomode] Northern Crater barrier: {got}/{total} goal items"
-                    + ("  ** GO MODE — the barrier is down **" if have_all else ""))
-        for title, names in groups:
-            owned   = [n for n in names if n in received]
-            missing = [n for n in names if n not in received]
-            line = f"[gomode] {title:<13} {len(owned)}/{len(names)}"
-            if missing:
-                line += "   missing: " + ", ".join(_short(n) for n in missing)
-            else:
-                line += "   complete"
-            logger.info(line)
+        # TWO gates since 2026-09-07, checked at different points in the game.
+        # Reporting them separately matters: a player with every Huge Materia can
+        # lower the barrier and explore the crater, and still be turned back at
+        # the point of no return for want of a character. One combined number
+        # would tell them they were ready when they were not.
+        gates = (
+            ("Northern Crater barrier", CRATER_REQUIRED_ITEMS, CRATER_LOCK_OFFSET,
+             (("Highwind",     ["Highwind"]),
+              ("Huge Materia", ["Huge Materia (Fort Condor)", "Huge Materia (Corel)",
+                                "Huge Materia (Underwater)", "Huge Materia (Rocket)"]))),
+            ("Point of no return", PARTY_GATE_REQUIRED_ITEMS, PARTY_GATE_OFFSET,
+             (("Party", ["Barret", "Tifa", "Aerith", "Red XIII",
+                         "Cait Sith", "Cid"]),)),
+        )
 
-        # The gate byte is what the field actually reads, so surface any
-        # disagreement rather than letting the player trust the checklist alone.
         pm = getattr(self.ctx, "pm", None)
-        if pm is not None:
-            try:
-                live = pm.read_uchar(SAVEMAP_BASE + CRATER_LOCK_OFFSET)
-                if bool(live) != have_all:
-                    logger.info(f"[gomode] (in-game gate byte is {live} — it syncs "
-                                "on the next delivery tick)")
-            except Exception as exc:
-                logger.debug(f"[gomode] gate read failed: {exc}")
-        else:
+        for title, required, offset, groups in gates:
+            have_all = required.issubset(received)
+            got = len(required & set(received))
+            logger.info(f"[gomode] {title}: {got}/{len(required)}"
+                        + ("   ** open **" if have_all else ""))
+            for gtitle, names in groups:
+                owned   = [n for n in names if n in received]
+                missing = [n for n in names if n not in received]
+                line = f"[gomode]   {gtitle:<13} {len(owned)}/{len(names)}"
+                line += ("   missing: " + ", ".join(_short(n) for n in missing)
+                         if missing else "   complete")
+                logger.info(line)
+            # The gate byte is what the game actually reads, so surface any
+            # disagreement rather than letting the player trust the checklist.
+            if pm is not None:
+                try:
+                    live = pm.read_uchar(SAVEMAP_BASE + offset)
+                    if bool(live) != have_all:
+                        logger.info(f"[gomode]   (in-game gate byte is {live} — it "
+                                    "syncs on the next delivery tick)")
+                except Exception as exc:
+                    logger.debug(f"[gomode] gate read failed: {exc}")
+
+        if pm is None:
             logger.info("[gomode] (game not attached — showing AP-received items only)")
         return True
 
@@ -1223,21 +1240,29 @@ class FF7CommandProcessor(ClientCommandProcessor):
         """List the town keys you own (town gating). Shows every town key
         received from Archipelago and whether its world-map gate bit is set
         in the running game (they can briefly differ right after receiving a
-        key, until the client's next delivery tick)."""
+        key, until the client's next delivery tick). Gate items that are not
+        town keys — currently the Lunar Harp — are listed underneath."""
         # Town keys = the KEY_ITEM_FLAGS entries living in the relocated
         # town-gate bytes (rel 0x403/0x404 = savemap 0xFA7/0xFA8).
         town_keys = [(name, flags[0]) for name, flags in KEY_ITEM_FLAGS.items()
                      if flags and flags[0][0] in (0x403, 0x404)]
+        # ...plus the gate items that byte filter cannot see, which are ordinary
+        # key items and so have to be named explicitly (see _EXTRA_GATE_KEYS).
+        extra_keys = [(name, KEY_ITEM_FLAGS[name][0], why)
+                      for name, why in _EXTRA_GATE_KEYS if KEY_ITEM_FLAGS.get(name)]
         received = getattr(self.ctx, "_received_item_names", set())
         pm = getattr(self.ctx, "pm", None)
         live: Dict[str, bool] = {}
         if pm is not None:
             try:
-                for name, (rel, bit) in town_keys:
+                for name, (rel, bit) in (town_keys
+                                         + [(n, f) for n, f, _ in extra_keys]):
                     live[name] = bool(pm.read_uchar(_biton_byte_addr(1, rel)) & (1 << bit))
             except Exception:
                 live = {}
-        owned = [n for n, _ in town_keys if n in received or live.get(n)]
+        def _held(n: str) -> bool:
+            return n in received or bool(live.get(n))
+        owned = [n for n, _ in town_keys if _held(n)]
         missing = [n for n, _ in town_keys if n not in owned]
         def _short(n: str) -> str:
             return n[:-4] if n.endswith(" Key") else n
@@ -1245,8 +1270,15 @@ class FF7CommandProcessor(ClientCommandProcessor):
                     + (", ".join(_short(n) for n in owned) if owned else "none"))
         if missing:
             logger.info("[keys] Missing: " + ", ".join(_short(n) for n in missing))
+        # One line each for the non-town gate items. They are listed whether held
+        # or not: the whole point is that a player looking at "Bone Village: yes"
+        # and a shut Forgotten Capital needs to see the other half of that gate.
+        for name, _flag, why in extra_keys:
+            logger.info(f"[keys] {name}: "
+                        f"{'held' if _held(name) else 'MISSING'} ({why})")
         # Flag keys received but not yet applied in-game (delivery pending).
-        pending = [n for n in owned if n in received and live and not live.get(n)]
+        pending = [n for n in owned + [k for k, _f, _w in extra_keys if _held(k)]
+                   if n in received and live and not live.get(n)]
         if pending:
             logger.info("[keys] Received but not yet applied in-game (will apply "
                         "on the next delivery tick): "
@@ -1534,6 +1566,9 @@ class FF7Context(CommonContext):
         self.gil_multiplier: int = 1
         self.ap_multiplier: int = 1
         self._reward_mult_applied: bool = False
+        # Progressive Limits (from slot_data): limits come from AP and the
+        # client suppresses the game's own kill/use-count teaching.
+        self.progressive_limits = False
         # Free Roam mode (from slot_data) — gates Free-Roam-only savemap fixups.
         self.free_roam: bool = False
         # ── Shop-purchase detection (Tier-3 native-grid AP shops) ────────────
@@ -1574,6 +1609,11 @@ class FF7Context(CommonContext):
             # Read victory condition from slot data (0 = defeat_sephiroth, 1 = escape_midgar)
             self.victory_condition = args.get("slot_data", {}).get("victory_condition", 0)
             self.free_roam = bool(args.get("slot_data", {}).get("free_roam", False))
+            # Off means "leave limits alone entirely" - the client must not
+            # suppress the game's own teaching in a seed that never had the
+            # items. Absent (an older seed) is treated as off for the same reason.
+            self.progressive_limits = bool(
+                args.get("slot_data", {}).get("progressive_limits", False))
             sd = args.get("slot_data", {})
             self.goals = list(sd.get("goals", []))
             self.weapon_goal_mask = int(sd.get("weapon_goal_mask", 0x1B))
@@ -1783,6 +1823,20 @@ def _suppress_client_flag_locations(ctx: "FF7Context", rel_offset: int, bit: int
 #     bit 5 Cotton Dress, bit 6 Satin Dress, bit 7 Silk Dress
 # These quest-state bits must be set when AP delivers a disguise item
 # remotely; otherwise the Wall Market scripts clear the disguise state.
+
+# Items that seal a world entry WITHOUT being town keys, for `/keys`. The
+# command finds town keys by their savemap byte (the relocated gate bytes
+# 0x403/0x404), and anything gating on an ordinary key-item possession bit is
+# invisible to that filter — so it has to be named here or `/keys` reports a
+# region as open when it is not.
+#
+# The Lunar Harp is the second key on the three Corel Valley strip world entries
+# (field.tbl 26 `sandun_2`, 57 `sango2`, 58 `lost1`), which Gold Saucer seals on
+# Bone Village AND the Harp together; see CraterBarrierPatcher's town table. Its
+# flag is the vanilla possession bit at bank 1 0x43.3, not a gate byte.
+_EXTRA_GATE_KEYS: Tuple[Tuple[str, str], ...] = (
+    ("Lunar Harp", "2nd key on the Corel Valley strip, with Bone Village"),
+)
 
 KEY_ITEM_FLAGS: Dict[str, List[Tuple[int, int]]] = {
     # 0x40 (inventory) + 0xA1 (quest state: dress process + dress selected + specific dress)
@@ -2483,18 +2537,31 @@ def _seed_glacier_wakeup(pm: "pymem.Pymem", ctx: "FF7Context") -> None:
 
 
 def _enforce_crater_lock(pm: "pymem.Pymem", ctx: "FF7Context") -> None:
-    """Drive the savemap Northern Crater gate byte: 1 once every goal item is
-    received (Highwind + full party + 4 Huge Materia), else 0. The Gold Saucer
-    field-gate reads this and bounces the player out while it is 0."""
-    unlocked = CRATER_REQUIRED_ITEMS.issubset(ctx._received_item_names)
-    try:
-        addr = SAVEMAP_BASE + CRATER_LOCK_OFFSET
-        if pm.read_uchar(addr) != (1 if unlocked else 0):
-            pm.write_uchar(addr, 1 if unlocked else 0)
-            if unlocked:
-                logger.debug("Northern Crater unlocked — all goal items received.")
-    except Exception as exc:
-        logger.debug(f"crater lock write failed: {exc}")
+    """Drive the two endgame gate bytes.
+
+    0x0D27 crater lock : the Huge Materia (+ Highwind) lower the barrier. Read by
+                         the wm0.ev descent gate patchCraterLanding installs.
+    0x0D28 party gate  : the canonical six are recruited. Read by the las4_0 field
+                         gate, the game's own point of no return.
+
+    Split on 2026-09-07 by request: the barrier used to want the party too, which
+    put the whole endgame behind one wall. Two bytes rather than one because the
+    requirements are now checked at different points, and both are written every
+    poll so a game over or a stale save cannot leave either stuck open.
+    """
+    for offset, required, what in (
+        (CRATER_LOCK_OFFSET, CRATER_REQUIRED_ITEMS, "Northern Crater barrier"),
+        (PARTY_GATE_OFFSET, PARTY_GATE_REQUIRED_ITEMS, "las4_0 party gate"),
+    ):
+        unlocked = required.issubset(ctx._received_item_names)
+        try:
+            addr = SAVEMAP_BASE + offset
+            if pm.read_uchar(addr) != (1 if unlocked else 0):
+                pm.write_uchar(addr, 1 if unlocked else 0)
+                if unlocked:
+                    logger.debug(f"{what} unlocked — requirements met.")
+        except Exception as exc:
+            logger.debug(f"{what} write failed: {exc}")
 
 
 def _suppress_diamond_scene(pm: "pymem.Pymem", ctx: "FF7Context") -> None:
@@ -3744,6 +3811,142 @@ _CHR_STATS = 0x02              # Str, Vit, Mag, Spr, Dex, Lck (1 byte each)
 _CHR_STAT_KEYS = ("str", "vit", "mag", "spr", "dex", "lck")
 _CHR_LIMITLEVEL = 0x0E; _CHR_LIMITBAR = 0x0F   # current limit level (1-4) / gauge
 _CHR_LIMITS = 0x22; _CHR_KILLS = 0x24          # learned-limit bitmask / kills+uses
+
+# --- Progressive Limits ------------------------------------------------------
+# The learned-limit bitmask gives each level three bits, of which FF7 uses two
+# (one for level 4): L1 = bits 0-2, L2 = 3-5, L3 = 6-8, L4 = bit 9.
+_LIMIT_L1_1_BIT   = 0x0001   # everyone has it from the start; never cleared
+_LIMIT_L4_BIT     = 0x0200   # taught by the manual item - not ours to touch
+# The steps an AP "Progressive Limit" grants, in order. NOT the same for
+# everyone: two characters simply do not have the standard seven limits, and
+# granting a bit for a limit that does not exist leaves the gauge filling on an
+# entry the game cannot draw. Reported from play 2026-09-09.
+#
+#   most characters  two techniques per level for levels 1-3, plus a level 4
+#                    from a manual item -- so AP grants 1-2, 2-1, 2-2, 3-1, 3-2
+#   Vincent          ONE limit per level (Galian Beast / Death Gigas /
+#                    Hellmasker / Chaos), so only the level-firsts exist. Level 1
+#                    is free and level 4 is his Chaos manual, leaving 2-1 and 3-1
+#   Cait Sith        TWO limits in total, Dice and Slots. No level 3, no level 4,
+#                    and no level-4 manual item exists for him anywhere in the
+#                    game -- there are 8 manuals for 9 characters. That leaves
+#                    exactly one step, 2-1 (Slots)
+_LIMIT_STEPS_DEFAULT  = (1, 3, 4, 6, 7)   # 1-2, 2-1, 2-2, 3-1, 3-2
+_LIMIT_STEPS_VINCENT  = (3, 6)            # 2-1, 3-1
+_LIMIT_STEPS_CAIT     = (3,)              # 2-1 (Slots)
+_LIMIT_LEVEL_FIRST_BIT = {1: 0, 2: 3, 3: 6, 4: 9}
+
+
+def _limit_steps_for(cid: int) -> tuple:
+    """Which limit bits Archipelago may grant this character, in order."""
+    if cid == 6:      # Cait Sith
+        return _LIMIT_STEPS_CAIT
+    if cid == 7:      # Vincent
+        return _LIMIT_STEPS_VINCENT
+    return _LIMIT_STEPS_DEFAULT
+
+_PROGRESSIVE_LIMIT_CIDS = {
+    "Progressive Limit (Cloud)":     0,
+    "Progressive Limit (Barret)":    1,
+    "Progressive Limit (Tifa)":      2,
+    "Progressive Limit (Aerith)":    3,
+    "Progressive Limit (Red XIII)":  4,
+    "Progressive Limit (Yuffie)":    5,
+    "Progressive Limit (Cait Sith)": 6,
+    "Progressive Limit (Vincent)":   7,
+    "Progressive Limit (Cid)":       8,
+}
+
+
+def _granted_limit_steps(ctx: "FF7Context") -> Dict[int, int]:
+    """How many Progressive Limit copies each character has been sent.
+
+    Counted from items_received rather than tracked incrementally, so it is
+    idempotent: the post-game-over re-deliver recounts to the same answer
+    instead of stacking, exactly like the chocobo ladder.
+    """
+    code_map = _get_code_to_item_name()
+    counts: Dict[int, int] = {}
+    for net in (getattr(ctx, "items_received", None) or []):
+        code = getattr(net, "item", None)
+        name = (code_map.get(code) if isinstance(code, int)
+                else (code if isinstance(code, str) else None))
+        cid = _PROGRESSIVE_LIMIT_CIDS.get(name)
+        if cid is not None:
+            counts[cid] = counts.get(cid, 0) + 1
+    return counts
+
+
+def _limit_mask_and_level(granted: int, current: int,
+                          steps: tuple = _LIMIT_STEPS_DEFAULT) -> Tuple[int, int]:
+    """The learned-limit mask and highest selectable level for `granted` steps.
+
+    Pure so the bit layout can be tested without a running game. `current` is the
+    character's existing mask, consulted only to carry level 4 through: that one
+    comes from the manual item, not from us, and clearing it would confiscate an
+    Omnislash the player legitimately owns.
+
+    `steps` is the character's own ladder - see _limit_steps_for. Vincent and
+    Cait Sith have shorter ones, and granting them a bit outside it would set a
+    limit the game has no technique for.
+
+    Level 1-1 (bit 0) is always set, so a character with nothing granted still
+    has a working limit rather than a gauge that fills and does nothing.
+    """
+    allowed = _LIMIT_L1_1_BIT
+    for i in range(max(0, min(granted, len(steps)))):
+        allowed |= 1 << steps[i]
+    allowed |= current & _LIMIT_L4_BIT
+    highest = max(lvl for lvl, bit in _LIMIT_LEVEL_FIRST_BIT.items()
+                  if allowed & (1 << bit))
+    return allowed, highest
+
+
+def _apply_limit_grants(pm: "pymem.Pymem", ctx: "FF7Context") -> None:
+    """Hold every character's limits at exactly what Archipelago has granted.
+
+    Two jobs, and the second is the point of the feature:
+
+    1. TEACH what has been sent - set the learned bit for each step received.
+    2. STOP the game teaching anything else. FF7 unlocks a limit LEVEL off the
+       kill counter and a level's second technique off the first's use counter,
+       so without this a player just grinds and the items mean nothing.
+
+    Suppression works by zeroing those counters, not by reverting the unlock
+    afterwards. Reverting would still let the battle-results screen announce a
+    limit the player then silently loses; starving the counters means the
+    threshold is never reached and nothing is ever announced. A single battle
+    cannot cross a level threshold from zero, and this runs every field/world
+    tick, so the counters never accumulate.
+
+    Level 1-1 always stays learned - nobody is ever left with no limit at all -
+    and level 4 is preserved untouched, because it comes from the manual item
+    (Omnislash and friends), which is a normal pool item that already works.
+    """
+    if not getattr(ctx, "progressive_limits", False):
+        return
+    counts = _granted_limit_steps(ctx)
+    for cid in _PROGRESSIVE_LIMIT_CIDS.values():
+        rec = SAVEMAP_BASE + _CHARS_OFFSET + cid * _CHAR_RECORD_SIZE
+        try:
+            current = pm.read_ushort(rec + _CHR_LIMITS)
+            allowed, highest = _limit_mask_and_level(counts.get(cid, 0), current,
+                                                     _limit_steps_for(cid))
+            if current != allowed:
+                pm.write_ushort(rec + _CHR_LIMITS, allowed)
+
+            # The selected level must not point at a limit that is not learned:
+            # the gauge fills and the Limit command shows nothing.
+            level = pm.read_uchar(rec + _CHR_LIMITLEVEL)
+            if level < 1 or level > highest:
+                pm.write_uchar(rec + _CHR_LIMITLEVEL, highest)
+
+            # kills + timesused1/2/3, the counters the engine unlocks from.
+            if pm.read_bytes(rec + _CHR_KILLS, 8) != b"\x00" * 8:
+                pm.write_bytes(rec + _CHR_KILLS, b"\x00" * 8, 8)
+        except Exception as exc:
+            logger.debug(f"limit grant for cid {cid} failed: {exc}")
+
 _CHR_WEAPON = 0x1C; _CHR_ARMOR = 0x1D; _CHR_ACCESSORY = 0x1E
 _CHR_STATUS = 0x1F; _CHR_ROW = 0x20
 _CHR_CURHP = 0x2C; _CHR_BASEHP = 0x2E; _CHR_CURMP = 0x30; _CHR_BASEMP = 0x32
@@ -5097,6 +5300,14 @@ def _deliver_items_to_game(pm: "pymem.Pymem", ctx: FF7Context) -> None:
                 still_pending.append((item_index, net_item))
             continue
 
+        if item_name in _PROGRESSIVE_LIMIT_CIDS:
+            # The grant itself is recomputed from items_received, so delivery is
+            # just "apply now" - the per-tick enforcement would pick it up
+            # anyway, this only avoids waiting for the next field tick.
+            _apply_limit_grants(pm, ctx)
+            ctx._delivered_item_indices.add(item_index)
+            continue
+
         if item_name in _CHARACTER_IDS:
             if _deliver_character(pm, item_name, _ap_seed(ctx), ctx):
                 ctx._delivered_item_indices.add(item_index)
@@ -5481,6 +5692,11 @@ async def game_watcher(ctx: FF7Context) -> None:
         # curing the first-delivered member's empty limit list.
         if _module in (GAME_MODULE_FIELD, GAME_MODULE_WORLD):
             _heal_party_limit_lists(pm, ctx)
+            # Field/world only, never battle or menu: those run working copies
+            # of the character records that we would be racing. Right after a
+            # battle we are back in the field, which is where the engine would
+            # have banked any unlock, so this still lands before it can stick.
+            _apply_limit_grants(pm, ctx)
         else:
             ctx._party_sig = b""
             ctx._party_sig_stable = 0
