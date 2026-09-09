@@ -138,21 +138,7 @@ BATTLE_FORMATION_ADDR = 0x9AAD3C
 # walk-end (Midgar coast). Like Ruby/Emerald, the Free Roam endgame skips the
 # world-script that would set his kill flag, so we latch it here on the battle win
 # (his wm0.ev spawn is gated on weapons_killed.bit1 so he then stays dead).
-# Ultimate: ONLY 287 (scene71/3, the lethal Cosmo battle - finite HP, no flee,
-# unescapable) latches a kill here. His other chase formations (280-286/294/988,
-# esp. the 281 flee-chase) are NOT in this dict: _resolve_weapon_battles commits a
-# pending kill on any return-to-World (no flee distinction), so a fled 281 would
-# false-latch Ultimate as dead. The legacy (feature-off) path instead latches him
-# via engagement in _resolve_ultimate_weapon.
-# NOTE: upstream removed Ultimate (its vanilla chase sets bit0 itself); kept
-# here because the arrival feature pins him Cosmo-settled with no chase.
-_WEAPON_BATTLE_FORMATIONS = {287: 0x01, 980: 0x02, 982: 0x08, 983: 0x08, 984: 0x10, 985: 0x10, 986: 0x10}
-# Ultimate Weapon (Free Roam): his kill flag weapons_killed.bit[0] is set by his
-# FINAL BATTLE, but the disc-2 chase that makes that battle lethal is skipped in Free
-# Roam, so the engine may never set it on its own. We register the kill the same way
-# as Ruby/Emerald: watch the live battle formation and, on returning to the map after
-# an Ultimate battle, set weapons_killed.bit[0] (the "Defeat Ultimate Weapon" check).
-# _resolve_ultimate_weapon then asserts the post-Ultimate world state so Ruby renders.
+_WEAPON_BATTLE_FORMATIONS = {980: 0x02, 982: 0x08, 983: 0x08, 984: 0x10, 985: 0x10, 986: 0x10}
 WEAPONS_KILLED_OFFSET  = 0x0C1F  # byte: bit0 = killed, bit2 = HP < 20,000
 SUBMARINE_FLAGS_OFFSET = 0x0F2A  # byte: bit3 = Ultimate Weapon chase started/engaged
 # Ultimate Weapon's CHASE HIT COUNTER (decompiled from wm0.ev, 2026-07-23).
@@ -810,6 +796,14 @@ class FF7CommandProcessor(ClientCommandProcessor):
                 f"Ultimate={'Y' if wk & 0x01 else 'N'} "
                 f"Ruby={'Y' if wk & 0x08 else 'N'} "
                 f"Emerald={'Y' if wk & 0x10 else 'N'}"
+            )
+            f29 = pm.read_uchar(SAVEMAP_BASE + 0x0F29)
+            logger.info(
+                f"[weapons] WEAPON Arrival: feature={'on' if self.ctx.weapon_arrival else 'off'} "
+                f"copies={_weapon_arrival_count(self.ctx)}  "
+                f"Diamond={'Y' if wk & 0x02 else 'N'}  load gates: Ultimate 0xF29.2="
+                f"{1 if f29 & 0x04 else 0} Emerald 0xF2B.6={1 if ruby_spawn & 0x40 else 0} "
+                f"Ruby spawn 0xF2B.4={1 if ruby_spawn & 0x10 else 0}"
             )
             logger.info(
                 f"[weapons] submarine_flags=0x{sf:02x} (Ultimate-engaged bit3="
@@ -2524,44 +2518,6 @@ def _suppress_diamond_scene(pm: "pymem.Pymem", ctx: "FF7Context") -> None:
         logger.debug(f"diamond scene suppress failed: {exc}")
 
 
-def _resolve_ultimate_weapon(pm: "pymem.Pymem", feature_on: bool) -> None:
-    """Finish Ultimate Weapon in Free Roam (his kill flag weapons_killed.bit[0]
-    is set by a final battle that never turns lethal because the disc-2 chase
-    is skipped - so once the player has engaged him via submarine_flags.bit[3],
-    set on the first ram, we latch bit[0] = death + AP check).
-
-    Legacy seeds also assert the full post-Ultimate world state here (0xF2A.4,
-    0xF2B.0, 0xF2B.4) so Ruby renders. With the WEAPON Arrival feature ON that
-    world state is owned by _resolve_ruby_spawn (arrival-count gated), so we do
-    ONLY the engagement->kill latch and touch none of the render flags."""
-    if feature_on:
-        # Arrival Ultimate is a real boss: he flees the 281 chase battles and is
-        # only killed in the lethal Cosmo battle 287, latched by
-        # _resolve_weapon_battles. Do NOT mark him defeated on mere engagement.
-        return
-    try:
-        wk_addr = SAVEMAP_BASE + WEAPONS_KILLED_OFFSET
-        sf_addr = SAVEMAP_BASE + SUBMARINE_FLAGS_OFFSET
-        wk = pm.read_uchar(wk_addr)
-        sf = pm.read_uchar(sf_addr)
-        if not (wk & 0x01):                       # not yet defeated
-            if not (sf & 0x08):                   # bit3 - not engaged yet
-                return
-            pm.write_uchar(wk_addr, wk | 0x01)    # engaged → mark defeated
-            logger.debug("Ultimate Weapon defeated (Free Roam) - weapons_killed.bit[0] set.")
-        # Legacy: assert the post-Ultimate state so world_progress hits 4 and
-        # Ruby's model is drawn. Re-checked each poll (self-heals on reload).
-        if not (sf & 0x10):                       # submarine_flags.bit4
-            pm.write_uchar(sf_addr, sf | 0x10)
-        f2b_addr = SAVEMAP_BASE + 0x0F2B
-        f2b = pm.read_uchar(f2b_addr)
-        if (f2b & 0x11) != 0x11:                  # 0xF2B.0 (wp4 cond) + 0xF2B.4 (Ruby spawn)
-            pm.write_uchar(f2b_addr, f2b | 0x11)
-            logger.debug("Post-Ultimate world state set - Ruby Weapon should now render.")
-    except Exception as exc:
-        logger.debug(f"resolve ultimate weapon failed: {exc}")
-
-
 def _seed_ultimate_hp(pm: "pymem.Pymem", ctx: "FF7Context") -> None:
     """Initialise Ultimate Weapon's remaining-HP field so his chase can start.
 
@@ -2772,12 +2728,14 @@ _DW_RUBY_DESC       = bytes.fromhex("d0d19600d8d196000300000080020000 98a89600".
 _DW_CANNON_DESC     = bytes.fromhex("64ce960070ce96000100000000100000 88a89600".replace(" ", ""))
 
 
-# Ruby-row lists (selectors 7/8, active post-Diamond now that Ruby's spawn
-# flags are always forced) leave Ultimate unbound - bind him into their free
+# Ruby-row lists (selectors 7/8) leave Ultimate unbound - bind him into their free
 # slot 9 while he is alive, mirroring the row-4 treatment. Originals are
 # captured at runtime and restored byte-exact.
 _DW_RUBY_LISTS = ((0x96B120 + 9 * 0x14, 0x96DF10 + 7 * 0x20),
                   (0x96B210 + 9 * 0x14, 0x96DF10 + 8 * 0x20))
+# Ultimate rows (5 and 6): slot 8 model entry and row byte, so Ruby can be drawn there.
+_DW_ULTIMA_LISTS = ((0x96AF10 + 8 * 0x14, 0x96DF10 + 5 * 0x20),
+                    (0x96B018 + 8 * 0x14, 0x96DF10 + 6 * 0x20))
 
 
 # WEAPON Arrival: progressive spawner item. copy 1 = Diamond, 2 = Ultimate,
@@ -2796,6 +2754,28 @@ def _weapon_arrival_count(ctx) -> int:
     return sum(1 for it in ctx.items_received if it.item == WEAPON_ARRIVAL_ITEM_CODE)
 
 
+# Arrival banners, byte 0x405: bits 0-3 waiting to show (the script clears them), bits 4-7 already shown.
+_ARRIVAL_ANNOUNCE_REL = 0x405
+
+
+def _resolve_arrival_announcements(pm: "pymem.Pymem", ctx, arrivals: int) -> None:
+    if not ctx.weapon_arrival:
+        return
+    try:
+        addr = _biton_byte_addr(1, _ARRIVAL_ANNOUNCE_REL)
+        v = pm.read_uchar(addr)
+        if v & 0x0F or pm.read_uchar(GAME_MODULE_ADDR) != GAME_MODULE_WORLD:
+            return
+        for n in range(1, 5):
+            done = 1 << (3 + n)
+            if arrivals >= n and not (v & done):
+                pm.write_uchar(addr, v | done | (1 << (n - 1)))
+                logger.debug(f"WEAPON Arrival {n}: banner scene armed.")
+                return
+    except Exception as exc:
+        logger.debug(f"arrival announce failed: {exc}")
+
+
 def _set_savemap_bit(pm: "pymem.Pymem", offset: int, mask: int, on: bool) -> None:
     addr = SAVEMAP_BASE + offset
     v = pm.read_uchar(addr)
@@ -2804,27 +2784,14 @@ def _set_savemap_bit(pm: "pymem.Pymem", offset: int, mask: int, on: bool) -> Non
         pm.write_uchar(addr, want)
 
 
-def _resolve_ruby_spawn(pm: "pymem.Pymem", arrivals: int, feature_on: bool) -> None:
-    """Drive Ruby's spawn/render flags by WEAPON Arrival count.
-
-    Two layers: (a) the post-Ultimate world state (0xF2B.0 + submarine_flags.4)
-    that puts the overworld at world_progress 4; (b) Ruby's own load/spawn
-    flag 0xF2B.4 - arrival 3 on. When the arrival feature is off (legacy
-    seeds), both are forced on so everything spawns as before. Below the
-    threshold Ruby's bit is actively CLEARED, so a lower count (or a stale
-    save) can never leave her rendering.
-
-    wp4 is held ON permanently, arrivals or not: at wp 2/3 the ENGINE natively
-    renders its own Ultimate roamer (the vanilla hover over the Junon-crater
-    lake) - he has no spawn flag of his own, so no slot-binding mask can hide
-    him there. wp4 retires that native roamer; Ultimate then only exists via
-    our arrival-gated slot bindings (>=2, Cosmo-settled), and Ruby stays
-    hidden in wp4 behind her own 0xF2B.4 until arrival 3."""
-    want_wp4  = True
-    want_ruby = (not feature_on) or arrivals >= 3
+def _resolve_ruby_spawn(pm: "pymem.Pymem", arrivals: int, feature_on: bool, wk: int) -> None:
+    """Ruby's spawn flag 0xF2B.4: on at arrival 3, or after Ultimate's crash on old seeds."""
     try:
-        _set_savemap_bit(pm, 0x0F2B, 0x01, want_wp4)                # wp4 condition
-        _set_savemap_bit(pm, SUBMARINE_FLAGS_OFFSET, 0x10, want_wp4)  # submarine_flags.4
+        crash_done = bool(wk & 0x01) and bool(
+            pm.read_uchar(SAVEMAP_BASE + SUBMARINE_FLAGS_OFFSET) & 0x10)
+        if crash_done:
+            _set_savemap_bit(pm, 0x0F2B, 0x01, True)               # wp4 condition
+        want_ruby = (arrivals >= 3) if feature_on else crash_done
         _set_savemap_bit(pm, 0x0F2B, 0x10, want_ruby)              # Ruby spawn/load bit
     except Exception as exc:
         logger.debug(f"resolve ruby spawn failed: {exc}")
@@ -2890,6 +2857,21 @@ def _bind_weapon_render_slots(ctx, pm: "pymem.Pymem", wk: int) -> None:
             pm.write_uchar(_DW_MASTER_ROW4 + 20, 0x09)
             ctx._dw_row4_ruby = False
             logger.debug("Ruby row-4 binding restored.")
+        r56 = getattr(ctx, "_dw_r56_ruby", False)
+        if ruby_alive and not r56:
+            for lst, row in _DW_ULTIMA_LISTS:
+                pm.write_bytes(lst, _DW_RUBY_DESC, 20)
+                pm.write_uchar(row + 29, 0x09)           # Ruby -> slot 8
+                pm.write_uchar(row + 20, 0xFF)           # cannon id -> unbound
+            ctx._dw_r56_ruby = True
+            logger.debug("Ruby (slot 8) bound into the Ultimate rows.")
+        elif not ruby_alive and r56:
+            for lst, row in _DW_ULTIMA_LISTS:
+                pm.write_bytes(lst, _DW_CANNON_DESC, 20)
+                pm.write_uchar(row + 29, 0xFF)
+                pm.write_uchar(row + 20, 0x09)
+            ctx._dw_r56_ruby = False
+            logger.debug("Ruby Ultimate-row bindings restored.")
     except Exception as exc:
         logger.debug(f"dual-render binding failed: {exc}")
 
@@ -3024,20 +3006,11 @@ def _resolve_diamond_weapon(ctx, pm: "pymem.Pymem") -> None:
             wk_eff |= 0x10
         _force_diamond_world_state(pm, wk_eff)
         _bind_weapon_render_slots(ctx, pm, wk_eff)
-        _resolve_ruby_spawn(pm, arrivals, ctx.weapon_arrival)
+        _resolve_ruby_spawn(pm, arrivals, ctx.weapon_arrival, wk)
         # Ultimate's patched wm0 load gate and Emerald's patched wm2 load gate
         # read these client-owned bits (arrival copies 2 and 4).
         _set_savemap_bit(pm, ULTIMATE_ARRIVAL_ADDR, ULTIMATE_ARRIVAL_MASK, arrivals >= 2)
         _set_savemap_bit(pm, EMERALD_ARRIVAL_ADDR, EMERALD_ARRIVAL_MASK, arrivals >= 4)
-        # Ultimate: pin him settled at the Cosmo spot (no flee-chase). His init
-        # places him by roam-byte 0x394 (13 = mesh 11,15 = Cosmo); the settle /
-        # touch->lethal-287 path needs 0xC1F.2 (his "HP<20k weakened" flag) and
-        # 0xF2A.3 (engaged). Touching him then goes straight to battle 287.
-        if arrivals >= 2 and not (wk & 0x01):
-            _set_savemap_bit(pm, 0x0F2A, 0x08, True)     # engaged
-            _set_savemap_bit(pm, WEAPONS_KILLED_OFFSET, 0x04, True)  # weakened (HP<20k)
-            if pm.read_uchar(SAVEMAP_BASE + 0x0F38) != 13:
-                pm.write_uchar(SAVEMAP_BASE + 0x0F38, 13)   # Cosmo settle location
         if not diamond_on:
             if alive:
                 # no arrival yet: keep his march flag off so he never loads
@@ -5370,6 +5343,12 @@ async def game_watcher(ctx: FF7Context) -> None:
                     log_once(f"FF7 process attached: {name}")
                     ctx.game_connected = True
                     ctx.pm = pm
+                    # New game process: forget what was written to the old one.
+                    for _f in ("_dw_geo_swapped", "_dw_geo_slots", "_dw_r78_bound",
+                               "_dw_r56_ruby", "_dw_row4_ult", "_dw_row4_ruby",
+                               "_dw_seen_world", "_dw_bounce_addrs", "_dw_roared"):
+                        if hasattr(ctx, _f):
+                            delattr(ctx, _f)
 
                     # The EXP/Gil/AP reward patch lives in the exe's code, so a
                     # fresh process (game relaunched / crashed without an AP
@@ -5631,9 +5610,9 @@ async def game_watcher(ctx: FF7Context) -> None:
             _suppress_diamond_scene(pm, ctx)
 
             if ctx.free_roam:
-                _resolve_ultimate_weapon(pm, ctx.weapon_arrival)
                 # Keep the map-fightable Diamond Weapon spawned until he is defeated.
                 _resolve_diamond_weapon(ctx, pm)
+                _resolve_arrival_announcements(pm, ctx, _weapon_arrival_count(ctx))
                 # Seed Ultimate's HP field if a fresh save left it at 0.
                 _seed_ultimate_hp(pm, ctx)
                 # Register Ultimate/Diamond/Ruby/Emerald kills from a won battle.
